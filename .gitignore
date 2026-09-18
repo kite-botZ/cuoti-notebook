@@ -1,0 +1,47 @@
+# ==================== Python ====================
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# ==================== 虚拟环境 ====================
+venv/
+.venv/
+env/
+ENV/
+
+# ==================== 敏感配置 ====================
+.env
+backend/.env
+frontend/.env.local
+frontend/.env.production.local
+*.key
+*.pem
+
+# ==================== 上传的文件 ====================
+backend/uploads/
+
+# ==================== Node ====================
+node_modules/
+dist/
+dist-ssr/
+*.local
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# ==================== IDE ====================
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# ==================== 系统 ====================
+.DS_Store
+Thumbs.db
+
+# ==================== 其他 ====================
+*.log
