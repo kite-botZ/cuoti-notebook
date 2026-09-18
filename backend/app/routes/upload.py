@@ -7,7 +7,7 @@ from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 
 from app.routes.banks import current_user_id
 
-router = APIRouter(prefix="/api", tags=["upload"])
+router = APIRouter(prefix="/api", tags=["uploads"])
 
 # 图片保存目录
 UPLOAD_DIR = Path(__file__).resolve().parent.parent.parent / "uploads"
