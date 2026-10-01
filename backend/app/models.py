@@ -68,3 +68,45 @@ class QuestionUserState(Base):
     wrong_count = Column(Integer, nullable=False, default=0)       # 累计答错次数
 
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+class PracticeSession(Base):
+    """用户在某题库某模式下的练习进度。
+
+    每个 (user_id, bank_id, source) 组合唯一。
+    """
+    __tablename__ = "practice_sessions"
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "bank_id", "source", name="uq_practice_session"),
+    )
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    user_id = Column(BigInteger, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    bank_id = Column(BigInteger, ForeignKey("question_banks.id", ondelete="CASCADE"), nullable=False, index=True)
+    source = Column(String(20), nullable=False, index=True)
+
+    question_ids = Column(JSON, nullable=False)
+    answers = Column(JSON, nullable=False, default=dict)
+    current_index = Column(Integer, nullable=False, default=0)
+
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+class UserSettings(Base):
+    """用户个性化设置。
+
+    单独建表而不在 users 上加字段，是为了以后加新设置时不用 ALTER TABLE。
+    """
+    __tablename__ = "user_settings"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    user_id = Column(
+        BigInteger,
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,
+        index=True,
+    )
+    daily_goal = Column(Integer, nullable=False, default=20)
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+

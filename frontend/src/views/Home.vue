@@ -6,11 +6,12 @@
       </router-link>
       <nav>
         <a class="active" href="#banks">我的题库</a>
+        <router-link to="/stats">学习报告</router-link>
       </nav>
-      <div class="user-actions">
+      <div class="user-actions" @click="openProfile">
         <span class="avatar">{{ userInitial }}</span>
-        <span>{{ username }}</span>
-        <button type="button" @click="logout">退出</button>
+        <span class="username-label">{{ username }}</span>
+        <span class="user-arrow">›</span>
       </div>
     </header>
 
@@ -64,6 +65,67 @@
       </div>
     </section>
 
+        <!-- 用户中心弹窗 -->
+    <div v-if="showProfileDialog" class="modal-backdrop" @click.self="closeProfile">
+      <section class="profile-modal">
+        <div class="profile-head">
+          <div class="profile-avatar">{{ userInitial }}</div>
+          <div>
+            <h2>{{ profileData.username }}</h2>
+            <p>注册于 {{ formatDate(profileData.created_at) }}</p>
+          </div>
+          <button class="profile-close" type="button" @click="closeProfile">✕</button>
+        </div>
+
+        <div class="profile-section">
+          <h3>修改密码</h3>
+          <div class="profile-field">
+            <label for="old-pwd">原密码</label>
+            <input
+              id="old-pwd"
+              v-model="pwdForm.old_password"
+              type="password"
+              autocomplete="current-password"
+              placeholder="请输入当前密码"
+            />
+          </div>
+          <div class="profile-field">
+            <label for="new-pwd">新密码</label>
+            <input
+              id="new-pwd"
+              v-model="pwdForm.new_password"
+              type="password"
+              autocomplete="new-password"
+              placeholder="至少 6 位"
+            />
+          </div>
+          <div class="profile-field">
+            <label for="confirm-pwd">确认新密码</label>
+            <input
+              id="confirm-pwd"
+              v-model="pwdForm.confirm"
+              type="password"
+              autocomplete="new-password"
+              placeholder="再次输入新密码"
+            />
+          </div>
+          <button
+            class="profile-submit"
+            type="button"
+            :disabled="changingPwd"
+            @click="changePassword"
+          >
+            {{ changingPwd ? '提交中…' : '修改密码' }}
+          </button>
+        </div>
+
+        <div class="profile-section">
+          <button class="profile-logout" type="button" @click="logoutFromProfile">退出登录</button>
+        </div>
+      </section>
+    </div>
+
+
     <div
       v-if="showBankDialog"
       class="modal-backdrop"
@@ -114,7 +176,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import request from '@/api/request'
 import { toast } from '@/composables/useToast'
@@ -189,6 +251,84 @@ async function confirmDeleteBank(bank: Bank) {
   }
 }
 
+// ==================== 用户中心 ====================
+const showProfileDialog = ref(false)
+const changingPwd = ref(false)
+const profileData = ref({ username: '', created_at: '' })
+
+const pwdForm = reactive({
+  old_password: '',
+  new_password: '',
+  confirm: '',
+})
+
+async function openProfile() {
+  showProfileDialog.value = true
+  pwdForm.old_password = ''
+  pwdForm.new_password = ''
+  pwdForm.confirm = ''
+
+  try {
+    const data = await request.get('/user/me') as { id: number; username: string; created_at: string }
+    profileData.value = { username: data.username, created_at: data.created_at }
+  } catch (e: any) {
+    toast.error(e.message || '加载失败')
+  }
+}
+
+function closeProfile() {
+  if (changingPwd.value) return
+  showProfileDialog.value = false
+}
+
+function formatDate(s: string) {
+  if (!s) return '未知'
+  return s.slice(0, 10)
+}
+
+async function changePassword() {
+  if (!pwdForm.old_password) {
+    toast.warning('请输入原密码')
+    return
+  }
+  if (pwdForm.new_password.length < 6) {
+    toast.warning('新密码至少 6 位')
+    return
+  }
+  if (pwdForm.new_password !== pwdForm.confirm) {
+    toast.warning('两次输入的新密码不一致')
+    return
+  }
+  if (pwdForm.old_password === pwdForm.new_password) {
+    toast.warning('新密码不能与原密码相同')
+    return
+  }
+
+  changingPwd.value = true
+  try {
+    await request.post('/user/change-password', {
+      old_password: pwdForm.old_password,
+      new_password: pwdForm.new_password,
+    })
+    toast.success('密码已修改，请重新登录')
+    setTimeout(() => {
+      localStorage.removeItem('token')
+      localStorage.removeItem('username')
+      router.push('/login')
+    }, 800)
+  } catch (e: any) {
+    toast.error(e.message || '修改失败')
+  } finally {
+    changingPwd.value = false
+  }
+}
+
+function logoutFromProfile() {
+  localStorage.removeItem('token')
+  localStorage.removeItem('username')
+  router.push('/login')
+}
+
 function logout() {
   localStorage.removeItem('token')
   localStorage.removeItem('username')
@@ -197,6 +337,158 @@ function logout() {
 </script>
 
 <style scoped>
+
+/* ============ 用户中心入口 ============ */
+.user-actions {
+  cursor: pointer;
+  padding: 6px 10px;
+  border-radius: 8px;
+  transition: background .18s;
+}
+.user-actions:hover {
+  background: #f1f8f5;
+}
+.user-arrow {
+  margin-left: 4px;
+  color: #b0bcc9;
+  font-size: 14px;
+}
+
+/* ============ 用户中心弹窗 ============ */
+.profile-modal {
+  width: min(100%, 460px);
+  border-radius: 16px;
+  background: #fff;
+  box-shadow: 0 18px 48px rgba(19, 49, 37, .2);
+  overflow: hidden;
+}
+
+.profile-head {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 24px;
+  background: linear-gradient(135deg, #f1f9f5, #eaf6f0);
+  position: relative;
+}
+.profile-avatar {
+  display: grid;
+  place-items: center;
+  flex: 0 0 54px;
+  width: 54px;
+  height: 54px;
+  border-radius: 50%;
+  color: #fff;
+  background: #c7853d;
+  font-size: 22px;
+  font-weight: 700;
+}
+.profile-head h2 {
+  margin: 0;
+  color: #1f2d3d;
+  font-size: 19px;
+}
+.profile-head p {
+  margin: 4px 0 0;
+  color: #7a8b9b;
+  font-size: 12px;
+}
+.profile-close {
+  position: absolute;
+  top: 16px;
+  right: 16px;
+  border: 0;
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  color: #7e8c85;
+  background: transparent;
+  font-size: 14px;
+  cursor: pointer;
+  transition: background .18s;
+}
+.profile-close:hover {
+  background: rgba(255, 255, 255, .7);
+}
+
+.profile-section {
+  padding: 20px 24px;
+  border-top: 1px solid #eef2f0;
+}
+.profile-section h3 {
+  margin: 0 0 14px;
+  color: #2d4238;
+  font-size: 14px;
+  font-weight: 650;
+}
+
+.profile-field {
+  margin-bottom: 12px;
+}
+.profile-field label {
+  display: block;
+  margin-bottom: 6px;
+  color: #47594f;
+  font-size: 13px;
+  font-weight: 600;
+}
+.profile-field input {
+  width: 100%;
+  height: 42px;
+  border: 1px solid #d8e4de;
+  border-radius: 8px;
+  padding: 0 12px;
+  color: #2d4238;
+  background: #fff;
+  outline: none;
+  box-sizing: border-box;
+  font-size: 14px;
+  transition: border-color .18s, box-shadow .18s;
+}
+.profile-field input:focus {
+  border-color: #28735f;
+  box-shadow: 0 0 0 3px rgba(40, 115, 95, .12);
+}
+
+.profile-submit {
+  width: 100%;
+  height: 42px;
+  margin-top: 6px;
+  border: 1px solid #1f6956;
+  border-radius: 8px;
+  color: #fff;
+  background: #1f6956;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background .18s;
+}
+.profile-submit:hover:not(:disabled) {
+  background: #175746;
+}
+.profile-submit:disabled {
+  opacity: .6;
+  cursor: not-allowed;
+}
+
+.profile-logout {
+  width: 100%;
+  height: 42px;
+  border: 1px solid #f3d6d1;
+  border-radius: 8px;
+  color: #bf4b3f;
+  background: #fff;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background .18s;
+}
+.profile-logout:hover {
+  background: #fff4f2;
+}
+
+
+
 .home-page {
   min-height: 100vh;
   color: #20332b;
@@ -242,6 +534,31 @@ function logout() {
   font-size: 14px;
   font-weight: 600;
 }
+
+.topbar nav {
+  display: flex;
+  gap: 24px;
+}
+.topbar nav a,
+.topbar nav .router-link-active {
+  display: grid;
+  place-items: center;
+  height: 100%;
+  color: #5a6b7c;
+  text-decoration: none;
+  font-size: 14px;
+  font-weight: 600;
+  transition: color .18s;
+  border-bottom: 2px solid transparent;
+}
+.topbar nav a:hover {
+  color: #1e6854;
+}
+.topbar nav a.active {
+  border-bottom-color: #28735f;
+  color: #1e6854;
+}
+
 .user-actions {
   display: flex;
   align-items: center;

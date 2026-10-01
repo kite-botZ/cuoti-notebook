@@ -5,6 +5,7 @@ import Forgot from '@/views/Forgot.vue'
 import Home from '@/views/Home.vue'
 import Practice from '@/views/Practice.vue'
 import Bank from '@/views/Bank.vue'
+import Stats from '@/views/Stats.vue'
 
 const router = createRouter({
   history: createWebHistory(),
@@ -16,6 +17,7 @@ const router = createRouter({
     { path: '/home', component: Home },
     { path: '/banks/:id', component: Bank },
     { path: '/practice', component: Practice },
+    { path: '/stats', component: Stats },
   ],
 })
 

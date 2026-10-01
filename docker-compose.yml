@@ -1,0 +1,67 @@
+services:
+  # ==================== MySQL ====================
+  db:
+    image: mysql:8.0
+    container_name: cuoti-db
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${DB_PASSWORD}
+      MYSQL_DATABASE: ${DB_NAME}
+      TZ: Asia/Shanghai
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+    ports:
+      # 本地调试时可连，生产可删掉这两行
+      - "3307:3306"
+    volumes:
+      - db_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-p${DB_PASSWORD}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # ==================== 后端 ====================
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: cuoti-backend
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DB_USER: root
+      DB_PASSWORD: ${DB_PASSWORD}
+      DB_HOST: db
+      DB_PORT: 3306
+      DB_NAME: ${DB_NAME}
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY}
+      JWT_EXPIRE_SECONDS: 3600
+      CODE_EXPIRE_SECONDS: 300
+      APP_ENV: production
+      AI_API_BASE: ${AI_API_BASE}
+      AI_MODEL: ${AI_MODEL}
+    ports:
+      - "3000:3000"
+    volumes:
+      # 上传的图片挂载出来，容器重启不丢
+      - uploads_data:/app/uploads
+
+  # ==================== 前端 ====================
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: cuoti-frontend
+    restart: unless-stopped
+    depends_on:
+      - backend
+    ports:
+      - "8080:80"
+
+volumes:
+  db_data:
+  uploads_data:

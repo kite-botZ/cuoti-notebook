@@ -45,3 +45,6 @@ Thumbs.db
 
 # ==================== 其他 ====================
 *.log
+
+
+docker-compose.override.yml

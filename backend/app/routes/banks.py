@@ -1,12 +1,4 @@
-"""题库 / 题目 / 答题 / 状态 / 进度 相关接口。
-
-关键设计：
-1. 题目列表不返回正确答案，只有提交答案的接口才返回。
-2. 题库和题目都按 user_id 隔离，防止越权。
-3. 答题历史 AnswerAttempt 只增不改；QuestionUserState 每个用户对每道题一条记录。
-4. 支持 5 种题型：single / multiple / judge / blank / short。
-5. 题干和选项支持 Markdown 图片语法 ![](url)，前端自行渲染。
-"""
+"""题库 / 题目 / 答题 / 状态 / 进度 相关接口。"""
 
 import os
 import re
@@ -30,15 +22,12 @@ router = APIRouter(prefix="/api", tags=["question-banks"])
 SECRET_KEY = os.getenv("JWT_SECRET_KEY", "dev-fallback-secret")
 ALGORITHM = "HS256"
 
-# 选项字母表（最多 8 个选项）
 LETTERS = "ABCDEFGH"
-
-# 支持的题型
-VALID_TYPES = {"single", "multiple", "judge", "blank", "short"}
+VALID_TYPES = {"single", "multiple", "judge", "blank", "short", "calc"}
 
 
 # ============================================================
-# 请求体模型
+# 请求体
 # ============================================================
 
 class BankCreate(BaseModel):
@@ -64,7 +53,6 @@ class QuestionUpdate(BaseModel):
 
 
 class AnswerCreate(BaseModel):
-    # 简答题可能为空，其他题型由业务层校验
     selected_answer: str = ""
 
 
@@ -78,7 +66,7 @@ class BatchCutBody(BaseModel):
 
 
 # ============================================================
-# 认证依赖
+# 认证
 # ============================================================
 
 security = HTTPBearer(auto_error=False)
@@ -87,29 +75,21 @@ security = HTTPBearer(auto_error=False)
 def current_user_id(
     credentials: HTTPAuthorizationCredentials | None = Depends(security),
 ) -> int:
-    """从 Authorization: Bearer <token> 里解析出 user_id。"""
     if not credentials:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="请先登录",
-        )
+        raise HTTPException(status_code=401, detail="请先登录")
     token = credentials.credentials
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         return int(payload["id"])
     except (jwt.PyJWTError, KeyError, TypeError, ValueError):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="登录已失效，请重新登录",
-        )
+        raise HTTPException(status_code=401, detail="登录已失效，请重新登录")
 
 
 # ============================================================
-# 辅助函数
+# 辅助
 # ============================================================
 
 def bank_for_user(bank_id: int, user_id: int, db: Session) -> QuestionBank:
-    """确认题库存在且属于当前用户，否则抛 404。"""
     bank = (
         db.query(QuestionBank)
         .filter(QuestionBank.id == bank_id, QuestionBank.user_id == user_id)
@@ -121,7 +101,6 @@ def bank_for_user(bank_id: int, user_id: int, db: Session) -> QuestionBank:
 
 
 def ensure_question_owned(question_id: int, user_id: int, db: Session) -> Question:
-    """确认题目属于当前用户的某个题库，否则抛 404。"""
     question = (
         db.query(Question)
         .join(QuestionBank, Question.bank_id == QuestionBank.id)
@@ -138,7 +117,6 @@ def ensure_question_owned(question_id: int, user_id: int, db: Session) -> Questi
 
 
 def get_or_create_state(user_id: int, question_id: int, db: Session) -> QuestionUserState:
-    """获取用户对某题的状态，没有就创建默认的。"""
     state = (
         db.query(QuestionUserState)
         .filter(
@@ -156,7 +134,6 @@ def get_or_create_state(user_id: int, question_id: int, db: Session) -> Question
 
 
 def question_payload(question: Question) -> dict:
-    """练习时返回的安全结构，不含正确答案。"""
     return {
         "id": question.id,
         "bank_id": question.bank_id,
@@ -172,10 +149,6 @@ def question_payload_with_state(
     state: QuestionUserState | None,
     include_answer: bool = False,
 ) -> dict:
-    """
-    题目信息 + 用户对它的状态。
-    include_answer=True 时才返回正确答案和解析（用于斩题列表等查看场景）。
-    """
     payload = {
         "id": question.id,
         "bank_id": question.bank_id,
@@ -199,14 +172,9 @@ def validate_question(
     options: list[str],
     correct_answer: str,
 ) -> tuple[list[str], str]:
-    """
-    校验题目结构，返回规范化后的 (options, correct_answer)。
-    不合法时抛 422。
-    """
     if question_type not in VALID_TYPES:
         raise HTTPException(status_code=422, detail=f"不支持的题型：{question_type}")
 
-    # 判断题：强制两个固定选项
     if question_type == "judge":
         options = ["正确", "错误"]
         ans = correct_answer.strip().upper()
@@ -214,7 +182,6 @@ def validate_question(
             raise HTTPException(status_code=422, detail="判断题答案必须是 A 或 B")
         return options, ans
 
-    # 单选题
     if question_type == "single":
         if len(options) < 2:
             raise HTTPException(status_code=422, detail="单选题至少需要 2 个选项")
@@ -228,7 +195,6 @@ def validate_question(
             )
         return options, ans
 
-    # 多选题：答案是多字母组合，去重排序
     if question_type == "multiple":
         if len(options) < 2:
             raise HTTPException(status_code=422, detail="多选题至少需要 2 个选项")
@@ -243,31 +209,27 @@ def validate_question(
                 raise HTTPException(status_code=422, detail=f"答案含无效选项：{ch}")
         return options, ans
 
-    # 填空题：无选项，答案为文本
     if question_type == "blank":
         ans = correct_answer.strip()
         if not ans:
             raise HTTPException(status_code=422, detail="填空题答案不能为空")
         return [], ans
 
-    # 简答题：无选项，答案为参考答案
-    if question_type == "short":
+    if question_type in ("short", "calc"):
         ans = correct_answer.strip()
         if not ans:
-            raise HTTPException(status_code=422, detail="简答题答案不能为空")
+            raise HTTPException(status_code=422, detail="答案不能为空")
         return [], ans
 
-    # 理论上不会走到这
     raise HTTPException(status_code=422, detail="未知的题型")
 
 
 # ============================================================
-# 题库接口
+# 题库
 # ============================================================
 
 @router.get("/banks")
 def list_banks(user_id: int = Depends(current_user_id), db: Session = Depends(get_db)):
-    """列出当前用户的所有题库，附带每库的题目数。"""
     rows = (
         db.query(QuestionBank, func.count(Question.id).label("question_count"))
         .outerjoin(
@@ -291,13 +253,12 @@ def list_banks(user_id: int = Depends(current_user_id), db: Session = Depends(ge
     ]
 
 
-@router.post("/banks", status_code=status.HTTP_201_CREATED)
+@router.post("/banks", status_code=201)
 def create_bank(
     body: BankCreate,
     user_id: int = Depends(current_user_id),
     db: Session = Depends(get_db),
 ):
-    """新建题库。"""
     bank = QuestionBank(user_id=user_id, **body.model_dump())
     db.add(bank)
     db.commit()
@@ -317,7 +278,6 @@ def delete_bank(
     user_id: int = Depends(current_user_id),
     db: Session = Depends(get_db),
 ):
-    """删除题库。外键 CASCADE 会一并删除题目、答题记录、状态。"""
     bank = bank_for_user(bank_id, user_id, db)
     db.delete(bank)
     db.commit()
@@ -325,29 +285,19 @@ def delete_bank(
 
 
 # ============================================================
-# 题目接口
+# 题目
 # ============================================================
 
 @router.get("/banks/{bank_id}/questions")
 def list_questions(
     bank_id: int,
     filter_type: str | None = None,
+    question_type: str | None = None,
     user_id: int = Depends(current_user_id),
     db: Session = Depends(get_db),
 ):
-    """
-    列出题库里的题目。
-
-    filter_type 可选值：
-      - None（不传）：全部题目
-      - wrong：做错过
-      - favorite：已收藏
-      - cut：已斩题（此时返回答案和解析）
-      - note：有笔记
-    """
     bank_for_user(bank_id, user_id, db)
 
-    # 用 outerjoin，保证没有状态记录的题也能查到
     query = (
         db.query(Question, QuestionUserState)
         .outerjoin(
@@ -367,9 +317,10 @@ def list_questions(
     elif filter_type == "note":
         query = query.filter(QuestionUserState.note != "")
 
-    rows = query.order_by(Question.id.desc()).all()
+    if question_type:
+        query = query.filter(Question.question_type == question_type)
 
-    # 斩题列表是"已移出练习"的题，允许看答案
+    rows = query.order_by(Question.id.desc()).all()
     include_answer = (filter_type == "cut")
 
     return [
@@ -378,20 +329,17 @@ def list_questions(
     ]
 
 
-@router.post("/banks/{bank_id}/questions", status_code=status.HTTP_201_CREATED)
+@router.post("/banks/{bank_id}/questions", status_code=201)
 def create_question(
     bank_id: int,
     body: QuestionCreate,
     user_id: int = Depends(current_user_id),
     db: Session = Depends(get_db),
 ):
-    """新建题目。"""
     bank_for_user(bank_id, user_id, db)
-
     options, correct_answer = validate_question(
         body.question_type, body.options, body.correct_answer
     )
-
     question = Question(
         bank_id=bank_id,
         stem=body.stem.strip(),
@@ -413,10 +361,6 @@ def update_question(
     user_id: int = Depends(current_user_id),
     db: Session = Depends(get_db),
 ):
-    """
-    编辑题目。
-    只更新请求里传了的字段，没传的保持原值。
-    """
     question = ensure_question_owned(question_id, user_id, db)
 
     new_type = body.question_type if body.question_type is not None else question.question_type
@@ -429,7 +373,6 @@ def update_question(
         if not body.stem.strip():
             raise HTTPException(status_code=422, detail="题干不能为空")
         question.stem = body.stem.strip()
-
     if body.explanation is not None:
         question.explanation = body.explanation
 
@@ -448,7 +391,6 @@ def delete_question(
     user_id: int = Depends(current_user_id),
     db: Session = Depends(get_db),
 ):
-    """删除题目。相关答题记录、状态会一并删除。"""
     question = ensure_question_owned(question_id, user_id, db)
     db.delete(question)
     db.commit()
@@ -456,7 +398,7 @@ def delete_question(
 
 
 # ============================================================
-# 答题接口
+# 答题
 # ============================================================
 
 @router.post("/questions/{question_id}/answer")
@@ -466,56 +408,57 @@ def submit_answer(
     user_id: int = Depends(current_user_id),
     db: Session = Depends(get_db),
 ):
-    """
-    提交答案并判分。
-    - 单选 / 判断：selected_answer 传 "A" / "B"
-    - 多选：selected_answer 传 "AB"
-    - 填空：selected_answer 传文本
-    - 简答：selected_answer 传文本
-    """
     question = ensure_question_owned(question_id, user_id, db)
 
     user_ans = str(body.selected_answer).strip()
 
-    # 除简答外，其他题型不能空
-    if question.question_type != "short" and not user_ans:
+    # 除简答 / 计算外，其他题型不能空
+    if question.question_type not in ("short", "calc") and not user_ans:
         raise HTTPException(status_code=422, detail="答案不能为空")
 
-    if question.question_type == "multiple":
-        # 多选：拆成集合比较，顺序无关
-        correct_set = set(str(question.correct_answer).upper())
+    correct_str = str(question.correct_answer or "")
+
+    # 用户答案含图片（如上传了草稿）→ 无法自动判分，让用户自评
+    user_has_image = "![" in user_ans
+
+    need_self_check = False
+    is_correct = False
+
+    if user_has_image:
+        need_self_check = True
+    elif question.question_type == "multiple":
+        correct_set = set(correct_str.upper())
         user_set = set(user_ans.upper())
         is_correct = (correct_set == user_set)
-    elif question.question_type == "short":
-        # 简答：去空格、去标点、转小写后比对
+    elif question.question_type in ("short", "calc"):
         def normalize(s: str) -> str:
             s = s.strip().lower()
             s = re.sub(r"\s+", "", s)
             s = re.sub(r"[，。！？；：、,.!?;:'\"“”‘’（）()\[\]【】]+", "", s)
             return s
-        is_correct = normalize(user_ans) == normalize(str(question.correct_answer))
+        is_correct = normalize(user_ans) == normalize(correct_str)
     else:
-        # 单选 / 判断 / 填空：忽略大小写直接比
-        is_correct = user_ans.upper() == str(question.correct_answer).upper()
+        is_correct = user_ans.upper() == correct_str.upper()
 
     # 写答题历史
     attempt = AnswerAttempt(
         user_id=user_id,
         question_id=question.id,
-        selected_answer=user_ans,
+        selected_answer=user_ans or "(空)",
         is_correct=is_correct,
     )
     db.add(attempt)
 
-    # 更新用户对题目的状态：答错时 wrong_count + 1
-    state = get_or_create_state(user_id, question.id, db)
-    if not is_correct:
+    # 自评题不算错，其他答错才 +1
+    if not is_correct and not need_self_check:
+        state = get_or_create_state(user_id, question.id, db)
         state.wrong_count = (state.wrong_count or 0) + 1
 
     db.commit()
 
     return {
         "correct": is_correct,
+        "need_self_check": need_self_check,
         "correct_answer": question.correct_answer,
         "explanation": question.explanation,
         "answered_at": int(time.time()),
@@ -523,7 +466,7 @@ def submit_answer(
 
 
 # ============================================================
-# 题目状态接口
+# 状态
 # ============================================================
 
 @router.post("/questions/{question_id}/favorite")
@@ -532,7 +475,6 @@ def toggle_favorite(
     user_id: int = Depends(current_user_id),
     db: Session = Depends(get_db),
 ):
-    """切换收藏状态。"""
     ensure_question_owned(question_id, user_id, db)
     state = get_or_create_state(user_id, question_id, db)
     state.is_favorite = not state.is_favorite
@@ -546,7 +488,6 @@ def toggle_cut(
     user_id: int = Depends(current_user_id),
     db: Session = Depends(get_db),
 ):
-    """切换斩题状态。"""
     ensure_question_owned(question_id, user_id, db)
     state = get_or_create_state(user_id, question_id, db)
     state.is_cut = not state.is_cut
@@ -561,9 +502,7 @@ def batch_cut(
     user_id: int = Depends(current_user_id),
     db: Session = Depends(get_db),
 ):
-    """批量斩题或恢复。"""
     bank_for_user(bank_id, user_id, db)
-
     questions = (
         db.query(Question)
         .filter(
@@ -573,21 +512,14 @@ def batch_cut(
         )
         .all()
     )
-
     if not questions:
         raise HTTPException(status_code=404, detail="没有找到可操作的题目")
-
     for q in questions:
         state = get_or_create_state(user_id, q.id, db)
         state.is_cut = body.is_cut
-
     db.commit()
-
     action = "斩题" if body.is_cut else "恢复"
-    return {
-        "message": f"已{action} {len(questions)} 道题",
-        "count": len(questions),
-    }
+    return {"message": f"已{action} {len(questions)} 道题", "count": len(questions)}
 
 
 @router.put("/questions/{question_id}/note")
@@ -597,7 +529,6 @@ def save_note(
     user_id: int = Depends(current_user_id),
     db: Session = Depends(get_db),
 ):
-    """保存笔记，整体覆盖。"""
     ensure_question_owned(question_id, user_id, db)
     state = get_or_create_state(user_id, question_id, db)
     state.note = body.note
@@ -605,17 +536,12 @@ def save_note(
     return {"question_id": question_id, "note": state.note}
 
 
-# ============================================================
-# 进度接口
-# ============================================================
-
 @router.get("/banks/{bank_id}/progress")
 def bank_progress(
     bank_id: int,
     user_id: int = Depends(current_user_id),
     db: Session = Depends(get_db),
 ):
-    """题库统计：题目数、答题次数、正确数、正确率。"""
     bank_for_user(bank_id, user_id, db)
 
     total = (
@@ -624,7 +550,6 @@ def bank_progress(
         .scalar()
         or 0
     )
-
     correct = (
         db.query(func.count(AnswerAttempt.id))
         .join(Question, AnswerAttempt.question_id == Question.id)
@@ -636,7 +561,6 @@ def bank_progress(
         .scalar()
         or 0
     )
-
     attempts = (
         db.query(func.count(AnswerAttempt.id))
         .join(Question, AnswerAttempt.question_id == Question.id)
@@ -644,7 +568,6 @@ def bank_progress(
         .scalar()
         or 0
     )
-
     return {
         "question_count": total,
         "attempt_count": attempts,
