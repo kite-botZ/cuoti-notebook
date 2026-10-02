@@ -65,7 +65,7 @@ class ResetPasswordBody(BaseModel):
 
 
 
-@router.post("/register")
+@router.post("/register", status_code=201)
 def register(body: RegisterBody, db: Session = Depends(get_db)):
     if not body.username or not body.password:
         raise HTTPException(status_code=400, detail="账号和密码不能为空")

@@ -1,13 +1,14 @@
-from sqlalchemy import BigInteger, Boolean, Column, DateTime, ForeignKey, Integer, JSON, String, Text, func, \
-    UniqueConstraint
-
+from sqlalchemy import (
+    BigInteger, Boolean, Column, DateTime, ForeignKey,
+    Integer, JSON, String, Text, UniqueConstraint, func,
+)
 from app.db import Base
 
 
 class User(Base):
     __tablename__ = "users"
 
-    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    id = Column(BigInteger().with_variant(Integer, "sqlite"), primary_key=True, autoincrement=True)
     username = Column(String(50), unique=True, nullable=False, index=True)
     password = Column(String(255), nullable=False)  # 演示用明文；生产要哈希
     created_at = Column(DateTime, server_default=func.now())
@@ -16,7 +17,7 @@ class User(Base):
 class QuestionBank(Base):
     __tablename__ = "question_banks"
 
-    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    id = Column(BigInteger().with_variant(Integer, "sqlite"), primary_key=True, autoincrement=True)
     user_id = Column(BigInteger, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
     name = Column(String(100), nullable=False)
     subject = Column(String(50), nullable=False, default="综合")
@@ -28,7 +29,7 @@ class QuestionBank(Base):
 class Question(Base):
     __tablename__ = "questions"
 
-    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    id = Column(BigInteger().with_variant(Integer, "sqlite"), primary_key=True, autoincrement=True)
     bank_id = Column(BigInteger, ForeignKey("question_banks.id", ondelete="CASCADE"), nullable=False, index=True)
     stem = Column(Text, nullable=False)
     question_type = Column(String(20), nullable=False, default="single")
@@ -43,7 +44,7 @@ class Question(Base):
 class AnswerAttempt(Base):
     __tablename__ = "answer_attempts"
 
-    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    id = Column(BigInteger().with_variant(Integer, "sqlite"), primary_key=True, autoincrement=True)
     user_id = Column(BigInteger, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
     question_id = Column(BigInteger, ForeignKey("questions.id", ondelete="CASCADE"), nullable=False, index=True)
     selected_answer = Column(Integer, nullable=False)
@@ -58,7 +59,7 @@ class QuestionUserState(Base):
         UniqueConstraint("user_id", "question_id", name="uq_user_question"),
     )
 
-    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    id = Column(BigInteger().with_variant(Integer, "sqlite"), primary_key=True, autoincrement=True)
     user_id = Column(BigInteger, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
     question_id = Column(BigInteger, ForeignKey("questions.id", ondelete="CASCADE"), nullable=False, index=True)
 
@@ -80,7 +81,7 @@ class PracticeSession(Base):
         UniqueConstraint("user_id", "bank_id", "source", name="uq_practice_session"),
     )
 
-    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    id = Column(BigInteger().with_variant(Integer, "sqlite"), primary_key=True, autoincrement=True)
     user_id = Column(BigInteger, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
     bank_id = Column(BigInteger, ForeignKey("question_banks.id", ondelete="CASCADE"), nullable=False, index=True)
     source = Column(String(20), nullable=False, index=True)
@@ -98,7 +99,7 @@ class UserSettings(Base):
     """
     __tablename__ = "user_settings"
 
-    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    id = Column(BigInteger().with_variant(Integer, "sqlite"), primary_key=True, autoincrement=True)
     user_id = Column(
         BigInteger,
         ForeignKey("users.id", ondelete="CASCADE"),

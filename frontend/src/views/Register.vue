@@ -387,6 +387,7 @@ input:focus {
   }
   header h2 {
     font-size: 27px;
+
   }
 }
 </style>
