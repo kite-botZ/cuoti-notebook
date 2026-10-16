@@ -6,12 +6,13 @@ import time
 
 import jwt
 from dotenv import load_dotenv
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Response, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
+from app.cache import QLIST_TTL, cache
 from app.db import get_db
 from app.models import AnswerAttempt, Question, QuestionBank, QuestionUserState
 
@@ -167,6 +168,33 @@ def question_payload_with_state(
     return payload
 
 
+def state_fields(state: QuestionUserState | None) -> dict:
+    """用户维度的状态字段。
+
+    这部分**故意不缓存**：收藏/斩题/笔记/错题数是高频写、低延迟要求的个人数据，
+    缓存它既省不了多少（本来就是按主键批量查）、又容易读到脏数据。
+    缓存只放「题目内容」这种写少读多的数据。
+    """
+    return {
+        "is_favorite": bool(state.is_favorite) if state else False,
+        "is_cut": bool(state.is_cut) if state else False,
+        "note": state.note if state else "",
+        "wrong_count": state.wrong_count if state else 0,
+    }
+
+
+def _content_item(question: Question) -> dict:
+    """题目内容快照（可缓存的部分）。"""
+    return {
+        "id": question.id,
+        "bank_id": question.bank_id,
+        "stem": question.stem,
+        "question_type": question.question_type,
+        "options": question.options,
+        "created_at": question.created_at,
+    }
+
+
 def validate_question(
     question_type: str,
     options: list[str],
@@ -281,6 +309,8 @@ def delete_bank(
     bank = bank_for_user(bank_id, user_id, db)
     db.delete(bank)
     db.commit()
+    # 缓存一致性：题库没了，它下面的题目缓存也要一起失效
+    cache.bump_bank_version(bank_id)
     return {"message": "题库已删除"}
 
 
@@ -288,45 +318,158 @@ def delete_bank(
 # 题目
 # ============================================================
 
+def states_for(user_id: int, question_ids: list[int], db: Session) -> dict[int, QuestionUserState]:
+    """按当前页的 id 批量取用户状态，避免逐题查询的 N+1。"""
+    if not question_ids:
+        return {}
+    rows = (
+        db.query(QuestionUserState)
+        .filter(
+            QuestionUserState.user_id == user_id,
+            QuestionUserState.question_id.in_(question_ids),
+        )
+        .all()
+    )
+    return {s.question_id: s for s in rows}
+
+
 @router.get("/banks/{bank_id}/questions")
 def list_questions(
     bank_id: int,
+    response: Response,
     filter_type: str | None = None,
     question_type: str | None = None,
+    page: int | None = None,
+    page_size: int = 50,
     user_id: int = Depends(current_user_id),
     db: Session = Depends(get_db),
 ):
+    """题目列表。
+
+    ## 分页
+
+    - 传 `page`：返回第 `page` 页（`page_size` 默认 50、上限 100），
+      响应头带 `X-Total-Count` / `X-Has-More`，前端据此做「加载更多」；
+    - 不传 `page`：保持 v1 行为返回全量（老调用方兼容用）。
+
+    v1 是一次性 `order_by(Question.id.desc()).all()`：题库里有两万道题时，
+    ORM 要把两万行实例化、再序列化成几 MB JSON 一次性吐出去。
+
+    ## 缓存一致性
+
+    只缓存「题目内容」，key 里带题库版本号：
+
+        cuoti:qlist:{bank_id}:{version}:{question_type}:{page}:{page_size}
+
+    题目新增/修改/删除/批量导入后 `INCR cuoti:ver:bank:{bank_id}`，
+    版本号一变，该题库所有旧 key 立刻失效（旧 key 靠 TTL 回收）。
+    这样做的好处是不需要 `KEYS`/`SCAN` 批量删除——Redis 是单线程的，
+    大 key 空间下 `KEYS` 会阻塞其它请求。
+
+    用户状态（收藏/斩题/笔记/错题数）**不缓存**，按当前页 id 批量查库。
+    这类数据写频率极高（每次答题、每次收藏都会变），缓存它省不了多少，
+    却要额外保证一致性，不划算。
+    """
     bank_for_user(bank_id, user_id, db)
 
-    query = (
-        db.query(Question, QuestionUserState)
-        .outerjoin(
-            QuestionUserState,
-            (QuestionUserState.question_id == Question.id)
-            & (QuestionUserState.user_id == user_id),
-        )
-        .filter(Question.bank_id == bank_id, Question.is_archived.is_(False))
-    )
+    page_size = max(1, min(int(page_size or 50), 100))
+    paginated = page is not None
+    if paginated and page < 1:
+        raise HTTPException(status_code=422, detail="page 必须 >= 1")
 
-    if filter_type == "wrong":
-        query = query.filter(QuestionUserState.wrong_count > 0)
-    elif filter_type == "favorite":
-        query = query.filter(QuestionUserState.is_favorite.is_(True))
-    elif filter_type == "cut":
-        query = query.filter(QuestionUserState.is_cut.is_(True))
-    elif filter_type == "note":
-        query = query.filter(QuestionUserState.note != "")
-
-    if question_type:
-        query = query.filter(Question.question_type == question_type)
-
-    rows = query.order_by(Question.id.desc()).all()
     include_answer = (filter_type == "cut")
+    state_filtered = filter_type in ("wrong", "favorite", "cut", "note")
 
-    return [
-        question_payload_with_state(question, state, include_answer)
-        for question, state in rows
-    ]
+    # 只有「分页 + 不按用户状态过滤」这一种请求才进缓存。
+    #
+    # 为什么不缓存全量请求：不传 page 时一个题库两万道题，
+    # 序列化出来是 8MB 的 JSON。把它塞进 Redis 有两个坏处——
+    # 一是单个 key 8MB（Redis 单线程，操作大 key 会阻塞别的请求），
+    # 二是「构造这个 value」的成本和直接查库差不多，缓存没省下什么。
+    # 这类请求是 v1 的遗留调用方式，本身就该被分页取代，所以不回源缓存。
+    use_cache = paginated and not state_filtered
+
+    if use_cache:
+        # ---------- 走缓存：题目内容 + 版本号 ----------
+        version = cache.bank_version(bank_id)
+        content_key = (
+            f"cuoti:qlist:{bank_id}:{version}:{question_type or '-'}:{page}:{page_size}"
+        )
+        content = cache.get_json(content_key)
+        if content is None:
+            query = db.query(Question).filter(
+                Question.bank_id == bank_id, Question.is_archived.is_(False)
+            )
+            if question_type:
+                query = query.filter(Question.question_type == question_type)
+            query = (
+                query.order_by(Question.id.desc())
+                .offset((page - 1) * page_size)
+                .limit(page_size)
+            )
+            content = [_content_item(row) for row in query.all()]
+            cache.set_json(content_key, content, QLIST_TTL)
+
+        total_key = f"cuoti:qcount:{bank_id}:{version}:{question_type or '-'}"
+        total = cache.get_json(total_key)
+        if total is None:
+            count_query = db.query(func.count(Question.id)).filter(
+                Question.bank_id == bank_id, Question.is_archived.is_(False)
+            )
+            if question_type:
+                count_query = count_query.filter(Question.question_type == question_type)
+            total = int(count_query.scalar() or 0)
+            cache.set_json(total_key, total, QLIST_TTL)
+
+        states = states_for(user_id, [c["id"] for c in content], db)
+        items = [
+            {**c, **state_fields(states.get(c["id"]))}
+            for c in content
+        ]
+    else:
+        # ---------- 回源：全量兼容路径，或按用户状态过滤（必须联表）----------
+        query = (
+            db.query(Question, QuestionUserState)
+            .outerjoin(
+                QuestionUserState,
+                (QuestionUserState.question_id == Question.id)
+                & (QuestionUserState.user_id == user_id),
+            )
+            .filter(Question.bank_id == bank_id, Question.is_archived.is_(False))
+        )
+
+        if filter_type == "wrong":
+            query = query.filter(QuestionUserState.wrong_count > 0)
+        elif filter_type == "favorite":
+            query = query.filter(QuestionUserState.is_favorite.is_(True))
+        elif filter_type == "cut":
+            query = query.filter(QuestionUserState.is_cut.is_(True))
+        elif filter_type == "note":
+            query = query.filter(QuestionUserState.note != "")
+
+        if question_type:
+            query = query.filter(Question.question_type == question_type)
+
+        query = query.order_by(Question.id.desc())
+
+        if paginated:
+            total = int(
+                query.with_entities(func.count(Question.id)).order_by(None).scalar() or 0
+            )
+            query = query.offset((page - 1) * page_size).limit(page_size)
+
+        rows = query.all()
+        items = [question_payload_with_state(q, s, include_answer) for q, s in rows]
+        if not paginated:
+            total = len(items)
+
+    response.headers["X-Total-Count"] = str(total)
+    response.headers["X-Page"] = str(page if paginated else 1)
+    response.headers["X-Page-Size"] = str(page_size if paginated else total)
+    response.headers["X-Has-More"] = str(
+        bool(paginated and page * page_size < total)
+    ).lower()
+    return items
 
 
 @router.post("/banks/{bank_id}/questions", status_code=201)
@@ -351,6 +494,8 @@ def create_question(
     db.add(question)
     db.commit()
     db.refresh(question)
+    # 写后失效：版本号 +1，该题库的题目列表缓存key全部作废
+    cache.bump_bank_version(bank_id)
     return question_payload(question)
 
 
@@ -382,6 +527,7 @@ def update_question(
 
     db.commit()
     db.refresh(question)
+    cache.bump_bank_version(question.bank_id)
     return question_payload(question)
 
 
@@ -392,8 +538,10 @@ def delete_question(
     db: Session = Depends(get_db),
 ):
     question = ensure_question_owned(question_id, user_id, db)
+    bank_id = question.bank_id
     db.delete(question)
     db.commit()
+    cache.bump_bank_version(bank_id)
     return {"message": "题目已删除"}
 
 
@@ -514,10 +662,22 @@ def batch_cut(
     )
     if not questions:
         raise HTTPException(status_code=404, detail="没有找到可操作的题目")
-    for q in questions:
-        state = get_or_create_state(user_id, q.id, db)
+
+    # 批量取已有状态，一次查完；缺的批量补，最后只 commit 一次。
+    # v1 是在循环里逐个 get_or_create_state——每次都可能单独 commit，
+    # 500 道题最坏就是 500 次 SELECT + 500 次 INSERT + 几百次事务提交。
+    ids = [q.id for q in questions]
+    existing = states_for(user_id, ids, db)
+    for qid in ids:
+        state = existing.get(qid)
+        if state is None:
+            state = QuestionUserState(user_id=user_id, question_id=qid)
+            db.add(state)
+            existing[qid] = state
         state.is_cut = body.is_cut
     db.commit()
+    # 只改了用户状态、没动题目内容，所以不用动题库版本号：
+    # 列表接口的用户状态字段本来就不走缓存。
     action = "斩题" if body.is_cut else "恢复"
     return {"message": f"已{action} {len(questions)} 道题", "count": len(questions)}
 

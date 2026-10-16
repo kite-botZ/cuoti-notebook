@@ -22,6 +22,33 @@ services:
       timeout: 5s
       retries: 20
 
+  # ==================== Redis ====================
+  # 只做缓存，不做持久化数据源，所以关掉 RDB/AOF：
+  # 缓存丢了会自己回源重建，没必要为了缓存牺牲写性能。
+  # maxmemory + allkeys-lru：内存到顶时优先淘汰最久没用的 key，
+  # 避免 Redis 被写满以后开始报 OOM。
+  redis:
+    image: redis:7-alpine
+    container_name: cuoti-redis
+    restart: unless-stopped
+    command:
+      - redis-server
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+      - --maxmemory
+      - 512mb
+      - --maxmemory-policy
+      - allkeys-lru
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
   # ==================== 后端 ====================
   backend:
     build:
@@ -31,6 +58,8 @@ services:
     restart: unless-stopped
     depends_on:
       db:
+        condition: service_healthy
+      redis:
         condition: service_healthy
     environment:
       DB_USER: root
@@ -44,6 +73,10 @@ services:
       APP_ENV: production
       AI_API_BASE: ${AI_API_BASE}
       AI_MODEL: ${AI_MODEL}
+      REDIS_URL: redis://redis:6379/0
+      DB_POOL_SIZE: 20
+      DB_MAX_OVERFLOW: 10
+      IMPORT_CHUNK_SIZE: 500
     ports:
       - "3000:3000"
     volumes:

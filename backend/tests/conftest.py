@@ -15,8 +15,23 @@ os.environ["JWT_SECRET_KEY"] = "test-secret-key-for-pytest"
 import pytest
 from fastapi.testclient import TestClient
 
+from app.cache import cache
 from app.db import Base, SessionLocal, engine, get_db
 from app.main import app
+
+
+@pytest.fixture(autouse=True)
+def clean_cache():
+    """每个用例跑之前清掉缓存命名空间。
+
+    缓存是**跨用例共享的外部状态**：SQLite 内存库每个用例都会重建，
+    但 Redis 里的 key 不会。如果不管，上一个用例缓存的"题库只有 2 道题"
+    会被下一个用例读到，测试就会随机失败——这类 flaky 测试比没有测试更糟。
+    """
+    cache.clear_namespace()
+    cache.reset_stats()
+    yield
+    cache.clear_namespace()
 
 
 @pytest.fixture(scope="function")

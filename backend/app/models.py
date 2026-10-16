@@ -1,6 +1,6 @@
 from sqlalchemy import (
     BigInteger, Boolean, Column, DateTime, ForeignKey,
-    Integer, JSON, String, Text, UniqueConstraint, func,
+    Index, Integer, JSON, String, Text, UniqueConstraint, func,
 )
 from app.db import Base
 
@@ -29,6 +29,13 @@ class QuestionBank(Base):
 class Question(Base):
     __tablename__ = "questions"
 
+    # 题目列表接口固定按 (bank_id, is_archived) 过滤、按 id 倒序分页，
+    # 单列索引 bank_id 之后还要回表过滤 is_archived 再排序；
+    # 换成覆盖这三列的联合索引，排序和过滤都能在索引里做完。
+    __table_args__ = (
+        Index("ix_questions_bank_active_id", "bank_id", "is_archived", "id"),
+    )
+
     id = Column(BigInteger().with_variant(Integer, "sqlite"), primary_key=True, autoincrement=True)
     bank_id = Column(BigInteger, ForeignKey("question_banks.id", ondelete="CASCADE"), nullable=False, index=True)
     stem = Column(Text, nullable=False)
@@ -44,10 +51,18 @@ class Question(Base):
 class AnswerAttempt(Base):
     __tablename__ = "answer_attempts"
 
+    # 「查某道题的答题历史 / 统计某题库正确率」都是按 (user_id, question_id) 组合查
+    __table_args__ = (
+        Index("ix_attempts_user_question", "user_id", "question_id"),
+    )
+
     id = Column(BigInteger().with_variant(Integer, "sqlite"), primary_key=True, autoincrement=True)
     user_id = Column(BigInteger, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
     question_id = Column(BigInteger, ForeignKey("questions.id", ondelete="CASCADE"), nullable=False, index=True)
-    selected_answer = Column(Integer, nullable=False)
+    # 修复：这里原本声明成 Integer，但写库时传的是 body.selected_answer（字符串，
+    # 多选题是 "AB" 这种）。SQLite 是弱类型所以测试全绿，MySQL 严格模式下
+    # 会直接报 1366 Incorrect integer value —— 属于被测试环境掩盖的线上必崩缺陷。
+    selected_answer = Column(String(255), nullable=False)
     is_correct = Column(Boolean, nullable=False)
     answered_at = Column(DateTime, server_default=func.now(), nullable=False)
 
@@ -57,6 +72,8 @@ class QuestionUserState(Base):
     # 联合唯一约束：同一个用户 + 同一道题，只能有一条记录
     __table_args__ = (
         UniqueConstraint("user_id", "question_id", name="uq_user_question"),
+        # 错题检索固定按 user_id + wrong_count>0 过滤、再按 wrong_count 排序
+        Index("ix_qus_user_wrong", "user_id", "wrong_count"),
     )
 
     id = Column(BigInteger().with_variant(Integer, "sqlite"), primary_key=True, autoincrement=True)

@@ -32,7 +32,13 @@ else:
         DATABASE_URL,
         echo=(APP_ENV == "development"),
         pool_pre_ping=True,
-        pool_size=3600,
+        # 修复：原本写死 pool_size=3600，而 MySQL 8 的 max_connections 默认只有 151。
+        # 压测一上量就会撞 "Too many connections"，而且空闲连接会一直占着服务端内存。
+        # 连接池应该按「并发 worker 数 × 每 worker 并发」估算，剩下的靠 max_overflow 兜。
+        pool_size=int(os.getenv("DB_POOL_SIZE", "20")),
+        max_overflow=int(os.getenv("DB_MAX_OVERFLOW", "10")),
+        pool_timeout=float(os.getenv("DB_POOL_TIMEOUT", "10")),
+        pool_recycle=int(os.getenv("DB_POOL_RECYCLE", "3600")),
     )
 
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
