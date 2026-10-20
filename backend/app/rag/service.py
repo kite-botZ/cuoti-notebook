@@ -189,10 +189,19 @@ def retrieve(
         except Exception:  # noqa: BLE001
             query_vec = None
 
+    # 引用要显示「来自哪本教材」，所以在这里一次性把文档标题查出来
+    titles = {
+        d.id: d.title
+        for d in db.query(KnowledgeDocument)
+        .filter(KnowledgeDocument.id.in_({c.doc_id for c in rows}))
+        .all()
+    }
+
     payload = [
         {
             "chunk_id": c.id,
             "doc_id": c.doc_id,
+            "title": titles.get(c.doc_id, ""),
             "text": c.text,
             "chapter": c.chapter,
             "page": c.page,

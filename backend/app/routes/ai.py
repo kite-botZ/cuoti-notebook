@@ -19,6 +19,13 @@ from app.agent.tools import TOOLS_SCHEMA, ToolContext
 from app.cache import EXPLAIN_TTL, cache, content_hash
 from app.db import get_db
 from app.models import Question, QuestionBank
+from app.rag.context import (
+    build_query,
+    format_context,
+    kp_names_for_question,
+    render_context_block,
+)
+from app.rag.service import retrieve
 from app.routes.banks import current_user_id
 
 router = APIRouter(prefix="/api/ai", tags=["ai"])
@@ -49,6 +56,10 @@ class ChatBody(BaseModel):
 class ExplainBody(BaseModel):
     question_id: int
     user_answer: str = ""
+    # ---- RAG 开关（默认开启，关掉就退回原来的纯模型讲解）----
+    use_rag: bool = True
+    rag_top_k: int = Field(default=5, ge=1, le=10)
+    rag_alpha: float = Field(default=0.5, ge=0.0, le=1.0)
 
 
 def build_question_context(question: Question, include_answer: bool = False) -> str:
@@ -141,12 +152,19 @@ async def ai_chat(
 # AI 解析（单轮，无工具；带 Redis 缓存）
 # ============================================================
 
-def explain_cache_key(question: Question, user_answer: str) -> tuple[str, str]:
+def explain_cache_key(question: Question, user_answer: str,
+                      rag_sig: str = "norag") -> tuple[str, str]:
     """AI 解析结果的缓存 key。
 
     key 里带「题目内容 + 用户答案」的内容哈希，好处是**不需要手动删缓存**：
     题干、选项、正确答案、官方解析任意一项被改，哈希就变，自然 miss。
     再加题目 id 是为了方便排查（能直接看出是哪道题）。
+
+    `rag_sig` 是这一步新加的，**非常关键**：接上 RAG 之后，回答依赖
+    「检索到了哪些片段」。如果不把它放进 key，会出现两种脏数据：
+    - 开 RAG 之前缓存的旧答案（没有任何引用）被当成新答案返回；
+    - 知识库更新后，检索结果变了，但缓存还返回旧引用。
+    所以 key 里要带上本次命中的 chunk id 列表（或 norag / none）。
 
     返回 (key, 哈希)，哈希同时用作防击穿锁的名字。
     """
@@ -157,6 +175,7 @@ def explain_cache_key(question: Question, user_answer: str) -> tuple[str, str]:
         question.correct_answer,
         question.explanation,
         user_answer,
+        rag_sig,
     )
     return f"cuoti:explain:{question.id}:{h}", h
 
@@ -165,12 +184,24 @@ def _sse(payload: dict) -> str:
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 
-def replay_cached(text: str):
+def sources_event(sources: list[dict], rag_mode: str) -> str:
+    """先发一条「引用来源」事件，再流式发正文。
+
+    前端只处理带 `content` 的事件（`if (parsed.content)`），
+    所以这条事件对老前端完全无副作用；新前端可以拿它渲染出处。
+    """
+    return _sse({"sources": sources, "rag_mode": rag_mode})
+
+
+def replay_cached(text: str, sources: list[dict] | None = None,
+                  rag_mode: str = "none"):
     """命中缓存时按同样的事件格式回放，前端不用改代码。
 
     `cached` 放在最前面：一是让客户端能第一时间知道这是缓存结果，
     二是压测脚本可以只扫每个事件的开头就能判断有没有回源。
+    引用来源也要一起回放，否则命中缓存时页面会丢掉出处。
     """
+    yield sources_event(sources or [], rag_mode)
     for i in range(0, len(text), REPLAY_CHUNK):
         yield _sse({"cached": True, "content": text[i:i + REPLAY_CHUNK]})
     yield "data: [DONE]\n\n"
@@ -205,16 +236,50 @@ async def ai_explain(
     """
     question = get_owned_question(body.question_id, user_id, db)
 
-    key, h = explain_cache_key(question, body.user_answer)
+    # ---------- 0. RAG 检索（必须在查缓存之前）----------
+    # 因为缓存 key 要包含「本次检索到了哪些片段」，否则知识库一变，
+    # 缓存就会返回带旧引用的答案。
+    rag_context = ""
+    sources: list[dict] = []
+    rag_mode = "off"
+    rag_sig = "norag"
+
+    if body.use_rag:
+        try:
+            kp_names = kp_names_for_question(db, question.id)
+            query = build_query(question, kp_names)
+            rag_result = retrieve(
+                db=db, query=query, top_k=body.rag_top_k, alpha=body.rag_alpha,
+                ai_api_base=AI_API_BASE,
+            )
+            hits = rag_result.get("hits") or []
+            rag_mode = rag_result.get("mode", "none")
+            if hits:
+                rag_context, sources = format_context(hits)
+                rag_sig = "rag:" + ",".join(str(s.get("chunk_id")) for s in sources)
+            else:
+                rag_sig = "rag:none"
+        except Exception:  # noqa: BLE001
+            # 检索挂了不能影响讲解——RAG 是增强，不是前置依赖
+            rag_mode = "error"
+            rag_sig = "rag:error"
+
+    key, h = explain_cache_key(question, body.user_answer, rag_sig)
 
     # ---------- 1. 命中缓存直接回放 ----------
     cached = cache.get_json(key)
     if cached and cached.get("text"):
-        return StreamingResponse(replay_cached(cached["text"]), media_type="text/event-stream")
+        return StreamingResponse(
+            replay_cached(cached["text"], cached.get("sources"), rag_mode),
+            media_type="text/event-stream",
+        )
 
     # ---------- 2. 没命中：先抢重建锁（防击穿）----------
+    # 必须先用 cache.enabled 短路：缓存不可用时 acquire_lock 永远返回 False，
+    # 于是每个请求都会掉进下面的等待分支，白等 CACHE_WAIT_TIMEOUT（120 秒）才生成。
+    # 实测这个分支会让"没装 Redis"的环境下每次 AI 解析都卡两分钟。
     lock_name = f"explain:{question.id}:{h}"
-    if not cache.acquire_lock(lock_name, ttl=LOCK_TTL):
+    if cache.enabled and not cache.acquire_lock(lock_name, ttl=LOCK_TTL):
         # 关键：等待必须扔到线程池里等。
         # cache.wait_for 内部是 time.sleep 轮询（同步阻塞），
         # 如果直接在 async 函数里调用，会把整个事件循环卡住几十秒——
@@ -223,7 +288,8 @@ async def ai_explain(
         filled = await run_in_threadpool(cache.wait_for, key, CACHE_WAIT_TIMEOUT)
         if filled and filled.get("text"):
             return StreamingResponse(
-                replay_cached(filled["text"]), media_type="text/event-stream"
+                replay_cached(filled["text"], filled.get("sources"), rag_mode),
+                media_type="text/event-stream",
             )
         # 等到超时还没回填（持锁方挂了）：自己生成，但不抢锁、不回填，
         # 避免和持锁方重复写缓存
@@ -244,7 +310,8 @@ async def ai_explain(
         "【当前题目】\n"
         f"{context}\n"
         f"{user_choice_info}\n\n"
-        "【工具调用规则 — 必须严格遵守】\n"
+        + render_context_block(rag_context)
+        + "【工具调用规则 — 必须严格遵守】\n"
         "1. 只有当用户**明确要求查看自己的错题记录**时，才调用 search_wrong_questions。\n"
         "2. 只有当用户**明确给出自己的答案并要求核对**时，才调用 grade_calculation。\n"
         "3. 其他所有情况都直接回答，绝对不要调用任何工具。\n\n"
@@ -268,6 +335,8 @@ async def ai_explain(
         """
         chunks: list[str] = []
         try:
+            # 先把引用来源发给前端，用户能一边等正文一边看到出处
+            yield sources_event(sources, rag_mode)
             stream = client.chat(model=AI_MODEL, messages=messages, stream=True)
             for chunk in stream:
                 content = chunk.get("message", {}).get("content", "")
@@ -276,7 +345,12 @@ async def ai_explain(
                     yield _sse({"content": content})
             text = "".join(chunks).strip()
             if text:
-                cache.set_json(key, {"text": text, "model": AI_MODEL}, EXPLAIN_TTL)
+                cache.set_json(
+                    key,
+                    {"text": text, "model": AI_MODEL, "sources": sources,
+                     "rag_mode": rag_mode},
+                    EXPLAIN_TTL,
+                )
             yield "data: [DONE]\n\n"
         except Exception as e:
             yield _sse({"error": str(e)})
