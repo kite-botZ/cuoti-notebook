@@ -1,7 +1,7 @@
 # 错题本 · Agentic AI 学习平台
 
 > 一个可以自己出题、自动判分、自动收集错题，并用**本地大模型**讲题的刷题系统。
-> 前后端分离，四条命令跑起来，数据全部留在自己电脑上。
+> 前后端分离，Docker 一键部署，数据全部留在自己的服务器上。
 
 <p>
   <img alt="python" src="https://img.shields.io/badge/Python-3.11+-3776AB?logo=python&logoColor=white">
@@ -12,52 +12,73 @@
   <img alt="docker" src="https://img.shields.io/badge/Docker-Compose-2496ED?logo=docker&logoColor=white">
 </p>
 
----
+<!--
+🔗 在线试用地址：如果你已经部署在阿里云 ECS 上，把下面这行的注释去掉并填上公网地址，
+   这是 README 里最值钱的一行 —— 面试官更愿意点开链接，而不是照文档在本地装环境：
+
+   **在线试用：<http://你的公网IP:8080>**（账号自己注册即可）
+-->
 
 <!--
-📷 建议在这里放 2~3 张截图（HTML 注释不会渲染，你放好图后把这段删掉）：
+📷 建议放 2~3 张截图（HTML 注释不会渲染，放好图后把这段删掉）：
    ![登录页](docs/screenshots/login.png)
-   ![题库与导入](docs/screenshots/bank.png)
+   ![题库与批量导入](docs/screenshots/bank.png)
    ![AI 解析](docs/screenshots/ai.png)
-   截图放在 docs/screenshots/ 下，然后删掉这段注释。
+   截图放 docs/screenshots/ 下。
 -->
+
+---
 
 ## 5 分钟跑起来
 
-只需要装好 [Docker Desktop](https://www.docker.com/products/docker-desktop/)，然后：
+### 方式一：部署到云服务器（阿里云 ECS / 任意 Linux）
+
+这是我实际用的部署方式。前提只有一台 Linux 服务器（**2 核 4G 起**，纯后端 2G 也能跑，
+但要跑 AI 模型建议 8G 以上）。
 
 ```bash
-# 1. 拉代码
+# 1. 装 Docker（已装可跳过；国内机器建议用阿里云镜像加速，见下方说明）
+curl -fsSL https://get.docker.com | sh
+sudo systemctl enable --now docker
+
+# 2. 拉代码 + 准备配置
 git clone https://github.com/kite-botZ/cuoti-notebook.git
 cd cuoti-notebook
-
-# 2. 准备配置（用默认值就能跑，不用改）
-cp .env.example .env
+cp .env.example .env          # 默认值就能跑；生产环境记得改 DB_PASSWORD / JWT_SECRET_KEY
 
 # 3. 一键启动（MySQL + Redis + 后端 + 前端 四个容器）
-docker compose up -d --build
+sudo docker compose up -d --build
 
-# 4. 看日志确认都起来了
-docker compose ps
+# 4. 确认四个容器都起来了
+sudo docker compose ps
 ```
 
-然后打开 **<http://localhost:8080>** → 点「注册」建个账号 → 开始用。
+**第 5 步：去阿里云控制台放行端口。** 进入实例 → 安全组 → 配置规则 → 入方向，添加：
 
-| 地址 | 说明 |
-|---|---|
-| <http://localhost:8080> | 前端页面 |
-| <http://localhost:3000/docs> | 后端接口文档（Swagger，可以直接调试） |
-| `localhost:3000` | 后端 API |
+| 端口 | 用途 | 是否必须 |
+|---|---|---|
+| `8080` | 前端页面 | ✅ 必须 |
+| `3000` | 后端 API / `/docs` 调试 | 可选（只想用页面可以不开放） |
 
-> ⏱ **首次启动需要构建镜像，大约 3~5 分钟**（要下载基础镜像）。
-> 之后再启动是秒级：`docker compose up -d`。
->
-> 想停掉：`docker compose down`（加 `-v` 会连数据库一起删掉）。
+然后在浏览器打开 **`http://你的公网IP:8080`** → 注册账号 → 开始用。
 
-<details>
-<summary><b>方式二：本地开发模式（不想用 Docker）</b></summary>
+> ⏱ **首次启动要构建镜像，约 3~5 分钟**（下载基础镜像 + 装依赖）。之后再启动是秒级。
+> 想停掉：`sudo docker compose down`（加 `-v` 会连数据库一起删除）。
 
-需要本机已有 **Python 3.11+ / Node 22+ / MySQL 8 / Redis 7**。
+---
+
+### 方式二：本地跑（不想上服务器）
+
+**有 Docker 的话**，和上面一样，只是不用配安全组，直接访问 `http://localhost:8080`：
+
+```bash
+git clone https://github.com/kite-botZ/cuoti-notebook.git
+cd cuoti-notebook
+cp .env.example .env
+docker compose up -d --build
+```
+
+**没有 Docker**，用本地开发模式。需要本机已有 **Python 3.11+ / Node 22+ / MySQL 8**：
 
 ```bash
 # 后端
@@ -65,7 +86,7 @@ cd backend
 python -m venv .venv && .venv\Scripts\activate     # macOS/Linux: source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env                                # 填上你的 MySQL 密码
-python run.py                                       # http://localhost:3000
+python run.py                                       # http://localhost:3000/docs
 
 # 前端（另开一个终端）
 cd frontend
@@ -73,13 +94,11 @@ npm install
 npm run dev                                         # http://localhost:5173
 ```
 
-本地开发时前端把 `/api` 和 `/uploads` 代理到 `localhost:3000`（见 `vite.config.ts`），
-所以要改后端地址只改 `frontend/.env.development` 里的 `VITE_API_TARGET`。
+前端开发时把 `/api` 和 `/uploads` 代理到 `localhost:3000`（见 `vite.config.ts`），
+要改后端地址只改 `frontend/.env.development` 里的 `VITE_API_TARGET`。
 
-Redis 是可选的：不装也能跑，缓存层会自动降级为直接查库（接口会慢一些）。
-想彻底关掉缓存，在 `backend/.env` 里设 `CACHE_DISABLED=1`。
-
-</details>
+> Redis 是可选的：不装也能跑，缓存层会自动降级为直接查库（接口慢一些）。
+> 想彻底关掉缓存，在 `backend/.env` 里设 `CACHE_DISABLED=1`。
 
 ---
 
@@ -87,12 +106,12 @@ Redis 是可选的：不装也能跑，缓存层会自动降级为直接查库�
 
 ### 题库与题目
 
-- 题库增删改查，按学科分类，每个账号只看得到自己的题库（按 `user_id` 隔离，越权返回 404）
+- 题库增删改查，按学科分类；每个账号只看得到自己的题库（按 `user_id` 隔离，越权返回 404）
 - 支持 **6 种题型**：单选、多选、判断、填空、简答、计算
 - **批量导入**：JSON / Excel / Word / PDF 四种格式，共用一套解析层
   - 落库前按「题干 + 题型 + 选项」做库内与文件内**双重去重**，同一文件重复导入不会产生重复题
-  - 逐行容错：个别行格式不对不会让整个文件失败，好行照常入库
-  - 返回**结构化错误清单**（第几行、什么原因），改完只需重传坏行
+  - **逐行容错**：个别行格式不对不会让整个文件失败，好行照常入库
+  - 返回**结构化错误清单**（第几行、什么原因），改完只需要重传坏行
 - 支持题干和答案里插入图片（手写草稿、试卷拍照）
 
 ### 答题与判分
@@ -105,17 +124,16 @@ Redis 是可选的：不装也能跑，缓存层会自动降级为直接查库�
 ### 错题本
 
 - 答错自动进错题本，累计 `wrong_count`
-- 支持**收藏**、**写笔记**、**斩题**（标记为已掌握，不再出现在练习里）
-- 支持**批量斩题**
+- 支持**收藏**、**写笔记**、**斩题**（标记为已掌握，不再出现在练习里）、**批量斩题**
 - 按「错题 / 收藏 / 斩题 / 有笔记」筛选
 
 ### AI 讲题（本地大模型，数据不出机器）
 
-- **AI 解析**：针对当前题目生成讲解，SSE 流式输出，有打字机效果，支持 LaTeX 公式渲染
+- **AI 解析**：针对当前题目生成讲解，SSE 流式输出有打字机效果，支持 LaTeX 公式渲染
 - **AI 助手**：基于 Function Calling 实现了两个工具，参考 ReAct 思路让模型自己决定调不调工具
   - `search_wrong_questions` —— 查你的错题（"我之前错过哪些类似的题？"）
   - `grade_calculation` —— 批改计算 / 简答 / 填空题（"我算的是 96，对吗？"）
-- 解析结果会缓存到 Redis，**同一道题再问不会重复调用模型**
+- 解析结果缓存到 Redis，**同一道题再问不会重复调用模型**
 
 ### 学习统计
 
@@ -133,11 +151,11 @@ Redis 是可选的：不装也能跑，缓存层会自动降级为直接查库�
 | 层 | 技术 | 说明 |
 |---|---|---|
 | 后端 | **Python 3.11 · FastAPI** | 原生异步框架，自动生成 OpenAPI 文档 |
-| ORM | **SQLAlchemy 2.x · PyMySQL** | 声明式模型，`Base.metadata.create_all` 自动建表 |
+| ORM | **SQLAlchemy 2.x · PyMySQL** | 声明式模型，启动时 `create_all` 自动建表 |
 | 数据库 | **MySQL 8** | `utf8mb4`，外键 `ON DELETE CASCADE` |
 | 缓存 | **Redis 7** | AI 解析结果缓存、题目列表缓存、防击穿分布式锁 |
 | 鉴权 | **PyJWT · bcrypt** | Bearer Token，`HTTPBearer` 依赖注入 |
-| 校验 | **Pydantic v2** | 请求体校验，统一 422 |
+| 校验 | **Pydantic v2** | 请求体校验，统一 422 错误格式 |
 | 导入解析 | **openpyxl · python-docx · pdfplumber** | 分别解析 Excel / Word / PDF |
 | AI | **Ollama** | 本地跑大模型，SSE 流式返回 |
 | 前端 | **Vue 3 · TypeScript · Vite** | Composition API，`<script setup>` |
@@ -147,10 +165,10 @@ Redis 是可选的：不装也能跑，缓存层会自动降级为直接查库�
 <details>
 <summary><b>为什么用 PyMySQL 而不是 mysqlclient？</b></summary>
 
-PyMySQL 是纯 Python 实现，不需要编译，`pip install` 就能用，镜像也不用装
-`gcc` / `libmysqlclient-dev` 这些编译依赖。（当前 Dockerfile 里还留着这几个包，
-是历史遗留，去掉可以再快一点。）
+PyMySQL 是纯 Python 实现，不需要编译，`pip install` 直接可用，镜像里也不用装
+`gcc` / `libmysqlclient-dev` 这些编译依赖。
 
+（当前后端 Dockerfile 里还留着这几个包，是历史遗留；去掉可以让构建再快一点。）
 </details>
 
 ---
@@ -182,7 +200,7 @@ cuoti-notebook/
     │   ├── components/         # AiAssistant 等通用组件
     │   ├── api/request.ts      # axios 实例（自动带 token、统一错误处理）
     │   └── router/index.ts     # 路由 + 登录守卫
-    ├── nginx.conf              # 生产环境的反代配置（含 SSE 关缓冲）
+    ├── nginx.conf              # 生产环境反代配置（含 SSE 关缓冲）
     └── Dockerfile
 ```
 
@@ -190,22 +208,23 @@ cuoti-notebook/
 
 ## ⚙️ 配置项
 
-后端所有配置都走环境变量，完整列表见 [`backend/.env.example`](backend/.env.example)。
+Docker 部署看根目录 `.env`；本地开发看 `backend/.env`（完整列表见 `backend/.env.example`）。
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
-| `DB_HOST` / `DB_PORT` | `127.0.0.1` / `3306` | MySQL 地址（容器里由 compose 覆盖成 `db:3306`） |
-| `DB_NAME` | `cuoti_login` | 数据库名，不存在会自动建表 |
+| `DB_PASSWORD` | — | MySQL root 密码，**compose 部署必填** |
+| `DB_NAME` | `cuoti_login` | 数据库名，容器首次启动自动创建 |
+| `DB_HOST` / `DB_PORT` | `127.0.0.1` / `3306` | 容器内由 compose 覆盖成 `db:3306` |
 | `DB_POOL_SIZE` | `20` | 连接池大小。**别超过 MySQL 的 `max_connections`（默认 151）** |
-| `JWT_SECRET_KEY` | — | 必填，签名密钥 |
+| `JWT_SECRET_KEY` | — | 签名密钥，**必填**，建议 ≥32 位随机串 |
 | `JWT_EXPIRE_SECONDS` | `3600` | Token 有效期 |
-| `REDIS_URL` | `redis://127.0.0.1:6379/0` | 缓存地址 |
+| `REDIS_URL` | `redis://127.0.0.1:6379/0` | 缓存地址，容器内是 `redis://redis:6379/0` |
 | `CACHE_DISABLED` | `0` | 设 `1` 彻底关闭缓存 |
 | `CACHE_EXPLAIN_TTL` | `86400` | AI 解析缓存时长（秒） |
 | `CACHE_QLIST_TTL` | `300` | 题目列表缓存时长（秒） |
 | `IMPORT_CHUNK_SIZE` | `500` | 导入时每多少条一个事务 |
-| `AI_API_BASE` | `http://localhost:11434` | Ollama 地址 |
-| `AI_MODEL` | `qwen2.5:7b` | 模型名，要和 `ollama list` 一致 |
+| `AI_API_BASE` | `http://localhost:11434` | Ollama 地址，容器内用 `http://host.docker.internal:11434` |
+| `AI_MODEL` | `qwen2.5:7b` | 模型名，必须和 `ollama list` 里的一致 |
 
 ---
 
@@ -213,10 +232,14 @@ cuoti-notebook/
 
 不装 Ollama 也能正常用其它功能，只是「AI 解析 / AI 助手」两个按钮会报错。
 
+**AI 模型要装在部署它的那台机器上**（放在容器外面，模型动辄几个 G，不适合塞进镜像）：
+
 ```bash
-# 1. 安装 Ollama：https://ollama.com/download
-# 2. 拉一个模型（4B 左右的模型在普通笔记本上够用）
-ollama pull qwen2.5:7b        # 或者 gemma3:4b / llama3.2:3b，更省显存
+# 1. 在服务器上安装 Ollama
+curl -fsSL https://ollama.com/install.sh | sh
+
+# 2. 拉一个模型（4B 左右在普通云服务器上够用；7B 建议 8G 内存以上）
+ollama pull qwen2.5:7b        # 或 gemma3:4b / llama3.2:3b，更省内存
 
 # 3. 确认服务在跑
 curl http://localhost:11434/api/tags
@@ -225,15 +248,36 @@ curl http://localhost:11434/api/tags
 然后改 `.env` 里的两行：
 
 ```env
-AI_API_BASE=http://host.docker.internal:11434   # Linux 改成 http://172.17.0.1:11434
+AI_API_BASE=http://host.docker.internal:11434
 AI_MODEL=qwen2.5:7b
 ```
 
-改完重启后端容器：`docker compose restart backend`。
+改完重启后端：`docker compose restart backend`。
 
-> 容器里访问宿主机的 Ollama 走 `host.docker.internal`；
-> 如果你是 Linux 并且 `host.docker.internal` 不通，在 `docker-compose.yml` 的
-> `backend` 服务下加一行 `extra_hosts: ["host.docker.internal:host-gateway"]`。
+> 容器访问宿主机的 Ollama 走 `host.docker.internal`。
+> 这个域名 Docker Desktop 自带；**Linux（含 ECS）已经在本项目的
+> `docker-compose.yml` 里通过 `extra_hosts: host-gateway` 映射好了**，不用额外改。
+>
+> 如果 Ollama 装在**另一台机器**上，直接填那台机器的内网 IP，并确保安全组放行 11434。
+
+---
+
+## 🔐 部署到公网要注意的 4 件事
+
+1. **改掉默认密码。** `.env` 里的 `DB_PASSWORD` 和 `JWT_SECRET_KEY` 必须换成自己的随机值：
+   ```bash
+   python3 -c "import secrets; print(secrets.token_urlsafe(48))"
+   ```
+2. **别把 MySQL 暴露到公网。** `docker-compose.yml` 里 `db` 服务的
+   `ports: ["3307:3306"]` 是给本地调试用的，**生产环境把这行删掉**——
+   容器之间通过内部网络 `db:3306` 通信，不需要走宿主机端口。
+3. **只用 HTTP 时别在公网传密码。** 需要正式对外，建议绑域名 + 配 HTTPS
+   （用 Nginx 反代加证书，或上云厂商的负载均衡）。
+4. **更新代码后要重建：**
+   ```bash
+   git pull && sudo docker compose up -d --build
+   ```
+   只 `restart` 不会更新代码（镜像没变）。
 
 ---
 
@@ -249,7 +293,7 @@ AI_MODEL=qwen2.5:7b
 | 含 8% 脏行的 1000 题导入 | 0%（整包失败） | 91.9%（附错误清单） |
 
 主要手段：**游标分页 + 联合索引 + Redis 内容缓存（版本号失效）+ `SET NX` 防击穿**。
-压测脚本在 `backend/scripts/`，可以自己复现：
+脚本在 `backend/scripts/`，可以自己复现：
 
 ```bash
 cd backend
@@ -281,25 +325,53 @@ pytest -q
 </details>
 
 <details>
+<summary><b>浏览器打不开公网 IP:8080</b></summary>
+
+按这个顺序查：
+
+1. 容器起来了吗：`sudo docker compose ps`（四个都该是 `Up`）
+2. 服务器本机通不通：`curl -I http://127.0.0.1:8080` — 通了说明是网络层问题
+3. **安全组放行了吗**（最常见的原因）：阿里云控制台 → 实例 → 安全组 → 入方向加 `8080`
+4. 服务器防火墙：`sudo ufw status` / `sudo firewall-cmd --list-ports`
+</details>
+
+<details>
+<summary><b>服务器内存不够，容器反复重启</b></summary>
+
+`docker compose ps` 显示 `Restarting`，基本是 OOM。看 `docker stats` 和
+`sudo dmesg | grep -i "killed process"` 确认。2G 内存跑四容器很紧，
+加 2G swap 可以缓解：
+
+```bash
+sudo fallocate -l 2G /swapfile && sudo chmod 600 /swapfile
+sudo mkswap /swapfile && sudo swapon /swapfile
+echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
+```
+
+长期方案是升到 4G，或者把 AI 模型放到另一台机器上。
+</details>
+
+<details>
 <summary><b>8080 / 3000 端口被占用</b></summary>
 
 改 `docker-compose.yml` 里对应服务的端口映射，比如把 `"8080:80"` 改成 `"8081:80"`，
-然后访问 <http://localhost:8081>。
+然后访问 `http://你的IP:8081`（记得安全组也要跟着放行 8081）。
 </details>
 
 <details>
 <summary><b>页面能打开，但接口全部 404 / 登录不上</b></summary>
 
-先看后端是不是真的起来了：`docker compose logs backend --tail 50`。
-最常见的原因是 MySQL 还没 ready 后端就启动了——等十几秒再刷新，
-或者 `docker compose restart backend`。
+先看后端日志：`sudo docker compose logs backend --tail 50`。
+最常见是 MySQL 还没 ready 后端就启动了——等十几秒刷新，
+或者 `sudo docker compose restart backend`。
 </details>
 
 <details>
 <summary><b>点「AI 解析」报错连不上 Ollama</b></summary>
 
-1. 本机确认服务在跑：`curl http://localhost:11434/api/tags`
-2. 确认容器能访问宿主机：Linux 用户看上面「启用 AI 功能」里的 `extra_hosts` 说明
+1. 服务器上确认模型服务在跑：`curl http://localhost:11434/api/tags`
+2. 确认容器能访问宿主机：`docker compose exec backend curl -s http://host.docker.internal:11434/api/tags`
+   （不通就检查 `docker-compose.yml` 里的 `extra_hosts`，或者 Docker 版本是否 ≥ 20.10）
 3. 确认 `AI_MODEL` 和 `ollama list` 里的名字**完全一致**（带 `:tag`）
 </details>
 
@@ -307,14 +379,14 @@ pytest -q
 <summary><b>批量导入点了没反应 / 提示 404</b></summary>
 
 确认后端代码是最新的（导入接口在 `backend/app/routes/import_questions.py`）。
-`docker compose up -d --build` 重新构建一次。
+`sudo docker compose up -d --build` 重新构建一次。
 </details>
 
 <details>
 <summary><b>中文出现乱码</b></summary>
 
-数据库必须是 `utf8mb4`。`docker-compose.yml` 里已经通过
-`--character-set-server=utf8mb4` 指定了；如果你用的是自己的 MySQL，
+数据库必须是 `utf8mb4`。`docker-compose.yml` 已通过
+`--character-set-server=utf8mb4` 指定；如果用外部 MySQL，
 建库时加 `CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci`。
 </details>
 
@@ -322,4 +394,4 @@ pytest -q
 
 ## 📄 License
 
-个人学习项目，未指定开源协议。如果你想用，请先开 issue 说一声。
+个人学习项目，未指定开源协议。想用请先开个 issue 说一声。

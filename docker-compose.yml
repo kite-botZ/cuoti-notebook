@@ -61,6 +61,11 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+    # 让容器里能用 host.docker.internal 访问宿主机的 Ollama。
+    # Docker Desktop（Windows / macOS）自带这个域名；Linux（含阿里云 ECS）上
+    # 必须显式映射到 docker 网桥网关，否则 AI 接口连不上宿主机模型。
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     environment:
       DB_USER: root
       DB_PASSWORD: ${DB_PASSWORD}
