@@ -205,3 +205,94 @@ class QuestionKnowledgePoint(Base):
     created_at = Column(DateTime, server_default=func.now())
 
 
+# ============================================================
+# 知识库文档（RAG 的语料来源）
+# ============================================================
+
+class KnowledgeDocument(Base):
+    """一本教材 / 一份讲义。
+
+    ## 为什么全局共享
+
+    教材是学科的公共知识，不是某个用户的私有数据。全局共享意味着
+    所有用户的检索都能命中同一份语料，知识库只会越用越全。
+
+    ## status 的意义
+
+    解析 + 切分 + 向量化是一条比较长的链路，中间任何一步都可能失败
+    （扫描件抽不出字、模型服务没开）。把状态落库，前端就能显示
+    「处理中 / 就绪 / 失败（原因）」，而不是让用户对着一个转圈的按钮干等。
+    """
+    __tablename__ = "knowledge_documents"
+
+    id = Column(BigInteger().with_variant(Integer, "sqlite"), primary_key=True, autoincrement=True)
+    title = Column(String(200), nullable=False)
+    subject = Column(String(50), nullable=False, default="综合", index=True)
+    filename = Column(String(255), nullable=False, default="")
+    file_type = Column(String(20), nullable=False, default="")
+
+    char_count = Column(Integer, nullable=False, default=0)
+    chunk_count = Column(Integer, nullable=False, default=0)
+    # pending / ready / failed
+    status = Column(String(20), nullable=False, default="pending", index=True)
+    error = Column(Text, nullable=False, default="")
+    # 哪一步失败的：load / clean / chunk / embed
+    failed_stage = Column(String(20), nullable=False, default="")
+
+    embed_model = Column(String(80), nullable=False, default="")
+    uploaded_by = Column(
+        BigInteger, ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    created_at = Column(DateTime, server_default=func.now())
+
+
+class DocumentChunk(Base):
+    """文档切出来的一个片段——检索的最小单位。
+
+    ## 元数据比文本更重要
+
+    纯向量相似度经常召回「字面像但知识点不相关」的段落。
+    这里把 `kp_id` / `subject` / `chapter` 一起存下来，检索时可以先按元数据过滤
+    再做向量比对，准确率会明显高于纯向量。论文里的对比实验就靠这几个字段。
+
+    ## embedding 用 JSON 存
+
+    小规模知识库（几千个 chunk）直接存在 MySQL 里、查出来在内存算余弦就够了，
+    不需要引入专门的向量数据库。规模上千以后可以换 pgvector / Chroma，
+    检索接口不用变。`embed_model` 要一起存：换模型后旧向量必须重建，
+    否则不同模型的向量混在一起算相似度是没意义的。
+    """
+    __tablename__ = "document_chunks"
+
+    __table_args__ = (
+        Index("ix_chunk_doc_index", "doc_id", "chunk_index"),
+        Index("ix_chunk_subject", "subject"),
+        Index("ix_chunk_kp", "kp_id"),
+    )
+
+    id = Column(BigInteger().with_variant(Integer, "sqlite"), primary_key=True, autoincrement=True)
+    doc_id = Column(
+        BigInteger,
+        ForeignKey("knowledge_documents.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    chunk_index = Column(Integer, nullable=False, default=0)
+
+    text = Column(Text, nullable=False)
+    char_count = Column(Integer, nullable=False, default=0)
+
+    subject = Column(String(50), nullable=False, default="综合")
+    chapter = Column(String(200), nullable=False, default="")
+    page = Column(Integer, nullable=True)
+    kp_id = Column(
+        BigInteger,
+        ForeignKey("knowledge_points.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+
+    embedding = Column(JSON(none_as_null=True), nullable=True)
+    embed_model = Column(String(80), nullable=False, default="")
+    created_at = Column(DateTime, server_default=func.now())
+
+
