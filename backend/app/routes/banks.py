@@ -15,13 +15,11 @@ from sqlalchemy.orm import Session
 from app.cache import QLIST_TTL, cache
 from app.db import get_db
 from app.models import AnswerAttempt, Question, QuestionBank, QuestionUserState
+from app.security import ALGORITHM, SECRET_KEY
 
 load_dotenv()
 
 router = APIRouter(prefix="/api", tags=["question-banks"])
-
-SECRET_KEY = os.getenv("JWT_SECRET_KEY", "dev-fallback-secret")
-ALGORITHM = "HS256"
 
 LETTERS = "ABCDEFGH"
 VALID_TYPES = {"single", "multiple", "judge", "blank", "short", "calc"}
