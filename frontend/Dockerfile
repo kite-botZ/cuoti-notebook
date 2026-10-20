@@ -1,5 +1,7 @@
 # ==================== 阶段 1：构建 ====================
-FROM node:20-alpine AS builder
+# 版本要跟 package.json 的 engines 字段对齐（^22.18.0 || >=24.12.0）：
+# 原来用 node:20 构建，不满足引擎要求，vite 8 在 20 上会装/构建失败。
+FROM node:22-alpine AS builder
 
 WORKDIR /app
 
