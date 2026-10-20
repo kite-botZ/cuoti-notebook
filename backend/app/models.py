@@ -1,5 +1,5 @@
 from sqlalchemy import (
-    BigInteger, Boolean, Column, DateTime, ForeignKey,
+    BigInteger, Boolean, Column, DateTime, Float, ForeignKey,
     Index, Integer, JSON, String, Text, UniqueConstraint, func,
 )
 from app.db import Base
@@ -126,5 +126,82 @@ class UserSettings(Base):
     )
     daily_goal = Column(Integer, nullable=False, default=20)
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+
+# ============================================================
+# 知识点相关（认知诊断的基础）
+# ============================================================
+
+class KnowledgePoint(Base):
+    """知识点——学科知识体系里的一个节点。
+
+    ## 为什么必须全局共享，而不是挂在用户下面
+
+    「错题认知诊断」诊断的对象是**知识点**，不是题目。
+    如果知识点按用户隔离，同一个「二次函数顶点式」会变成几十条互不相干的记录，
+    学生之间没法比较、诊断结果也没法汇总。所以知识点是学科层面的公共分类，
+    和题库的归属（user_id）是两回事。
+
+    ## parent_id
+
+    支持层级（「函数」→「二次函数」→「顶点式」）。前端可以按树展示，
+    诊断时也能把子知识点的掌握度向上汇总。
+
+    ## 唯一性
+
+    `(subject, name)` 唯一：同一学科里不允许出现两个同名知识点。
+    没有把 parent_id 放进唯一约束，是因为 MySQL 里 `NULL != NULL`，
+    唯一约束对「顶级节点」根本不生效，容易埋坑。
+    """
+    __tablename__ = "knowledge_points"
+
+    __table_args__ = (
+        UniqueConstraint("subject", "name", name="uq_kp_subject_name"),
+    )
+
+    id = Column(BigInteger().with_variant(Integer, "sqlite"), primary_key=True, autoincrement=True)
+    name = Column(String(100), nullable=False)
+    subject = Column(String(50), nullable=False, default="综合", index=True)
+    parent_id = Column(
+        BigInteger,
+        ForeignKey("knowledge_points.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+    description = Column(String(255), nullable=False, default="")
+    created_at = Column(DateTime, server_default=func.now())
+
+
+class QuestionKnowledgePoint(Base):
+    """题目 ↔ 知识点 的多对多关联。
+
+    - `weight`：这道题对该知识点的考查权重（0~1）。一道题常常同时考好几个知识点，
+      后面 BKT 更新掌握度时按 weight 分配这次作答的影响。
+    - `source`：这条关联怎么来的——`manual` 人工标注 / `llm` 模型自动标注。
+      论文里要用它统计「自动标注占比」，也方便人工复核时只挑 llm 的看。
+    """
+    __tablename__ = "question_knowledge_points"
+
+    __table_args__ = (
+        UniqueConstraint("question_id", "kp_id", name="uq_question_kp"),
+        Index("ix_qkp_kp", "kp_id", "question_id"),
+    )
+
+    id = Column(BigInteger().with_variant(Integer, "sqlite"), primary_key=True, autoincrement=True)
+    question_id = Column(
+        BigInteger,
+        ForeignKey("questions.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    kp_id = Column(
+        BigInteger,
+        ForeignKey("knowledge_points.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    weight = Column(Float, nullable=False, default=1.0)
+    source = Column(String(20), nullable=False, default="manual")
+    created_at = Column(DateTime, server_default=func.now())
 
 
