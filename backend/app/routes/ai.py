@@ -12,12 +12,13 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
-import ollama
 
 from app.agent.react import run_react_stream
 from app.agent.tools import TOOLS_SCHEMA, ToolContext
 from app.cache import EXPLAIN_TTL, cache, content_hash
 from app.db import get_db
+from app.llm import OLLAMA_BASE as AI_API_BASE
+from app.llm import chat_model, describe, get_chat_client
 from app.models import Question, QuestionBank
 from app.rag.context import (
     build_query,
@@ -30,8 +31,8 @@ from app.routes.banks import current_user_id
 
 router = APIRouter(prefix="/api/ai", tags=["ai"])
 
-AI_API_BASE = os.getenv("AI_API_BASE", "http://localhost:11434")
-AI_MODEL = os.getenv("AI_MODEL", "qwen2.5:7b")
+# 具体模型名由 LLM_PROVIDER 决定：本地 Ollama 用 AI_MODEL，百炼用 BAILIAN_MODEL
+AI_MODEL = chat_model()
 
 # 没抢到重建锁时，最多等多久别人回填缓存（秒）。
 # 要大于「单次模型生成时间」，否则等待方会在别人还没生成完时超时并重复回源。
@@ -130,7 +131,7 @@ async def ai_chat(
         f"【当前题目】\n{build_question_context(question, include_answer=False)}"
     )
 
-    client = ollama.Client(host=AI_API_BASE)
+    client = get_chat_client()
     ctx = ToolContext(db=db, user_id=user_id)
 
     user_messages = [{"role": m.role, "content": m.content} for m in body.messages]
@@ -320,7 +321,7 @@ async def ai_explain(
         "2. 回答中如果用到数学公式，请使用 LaTeX 语法：行内公式用 $...$，块级公式用 $$...$$。"
     )
 
-    client = ollama.Client(host=AI_API_BASE)
+    client = get_chat_client()
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": "请生成解析。"},
@@ -358,3 +359,21 @@ async def ai_explain(
             cache.release_lock(lock_name)
 
     return StreamingResponse(stream_and_fill(), media_type="text/event-stream")
+
+
+@router.get("/info")
+def ai_info():
+    """当前接的是哪个模型服务。
+
+    排查「AI 不能用」时第一步就看这个：provider 对不对、key 配没配、
+    模型名是不是你要的那个。**不会返回 key 本身。**
+    """
+    info = describe()
+    try:
+        # 只是构造客户端，不真正发请求，用来暴露「key 没配」这类配置错误
+        info["client_ready"] = get_chat_client() is not None
+        info["error"] = ""
+    except Exception as e:  # noqa: BLE001
+        info["client_ready"] = False
+        info["error"] = str(e)
+    return info

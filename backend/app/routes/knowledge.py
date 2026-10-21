@@ -34,11 +34,14 @@ from app.knowledge import (
     is_useful_kp,
     tag_questions,
 )
+from app.llm import chat_model, get_chat_client
 from app.models import KnowledgePoint, Question, QuestionKnowledgePoint
-from app.routes.ai import AI_API_BASE, AI_MODEL
+from app.routes.ai import AI_API_BASE
 from app.routes.banks import bank_for_user, current_user_id, ensure_question_owned
 
 router = APIRouter(prefix="/api", tags=["knowledge"])
+
+AI_MODEL = chat_model()
 
 
 # ============================================================
@@ -243,13 +246,12 @@ def auto_tag_bank(
                        f"{(len(questions) + batch_size - 1) // batch_size} 批",
         }
 
-    # 延迟导入：没有装 ollama 包时，其它接口仍然能正常用
+    # 客户端由 LLM_PROVIDER 决定（本地 Ollama / 百炼），这里不关心具体是哪个
     try:
-        import ollama
-    except ImportError:
-        raise HTTPException(status_code=503, detail="服务端未安装 ollama 依赖")
+        client = get_chat_client()
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=503, detail=f"模型服务不可用：{e}")
 
-    client = ollama.Client(host=AI_API_BASE)
     report = tag_questions(
         db=db,
         questions=questions,

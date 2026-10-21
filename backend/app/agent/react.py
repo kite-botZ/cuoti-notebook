@@ -15,8 +15,7 @@
 """
 
 import json
-
-import ollama
+from typing import Any
 
 from app.agent.tools import ToolContext, execute_tool
 
@@ -25,7 +24,7 @@ MAX_ITERATIONS = 5
 
 
 def run_react_stream(
-    client: ollama.Client,
+    client: Any,
     model: str,
     system_prompt: str,
     user_messages: list[dict],
@@ -91,7 +90,11 @@ def run_react_stream(
                         args_raw = {}
 
                 if name:
-                    tool_calls.append({"name": name, "args": args_raw})
+                    # 带上 id：OpenAI 兼容接口（如阿里云百炼）在回传工具结果时，
+                    # 必须用 tool_call_id 对应上具体是哪个调用，否则会报 400。
+                    # 本地 Ollama 不给 id，get 到 None 时下面会跳过这个字段。
+                    tool_calls.append({"name": name, "args": args_raw,
+                                       "id": tc.get("id")})
 
         # 把助手这轮输出加入历史
         assistant_msg: dict = {"role": "assistant", "content": content_buffer}
@@ -99,6 +102,7 @@ def run_react_stream(
             assistant_msg["tool_calls"] = [
                 {
                     "type": "function",
+                    **({"id": tc["id"]} if tc.get("id") else {}),
                     "function": {
                         "name": tc["name"],
                         "arguments": tc["args"],
@@ -134,6 +138,7 @@ def run_react_stream(
 
             messages.append({
                 "role": "tool",
+                **({"tool_call_id": tc["id"]} if tc.get("id") else {}),
                 "content": json.dumps(result, ensure_ascii=False),
             })
 
