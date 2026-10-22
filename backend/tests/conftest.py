@@ -10,7 +10,12 @@ import os
 
 # ⚠️ 必须放在 import app 之前！
 os.environ["APP_ENV"] = "testing"
-os.environ["JWT_SECRET_KEY"] = "test-secret-key-for-pytest"
+# 测试一律走 ollama 分支：涉及模型调用的用例都是 patch `ollama.Client`，
+# 如果继承了开发机 backend/.env 里的 LLM_PROVIDER=bailian，
+# 就会绕过 mock 去连真实云端（没配 key 时直接 9 个用例报 LLMError）。
+# load_dotenv() 默认不覆盖已存在的环境变量，所以在这里钉住就够了。
+os.environ["LLM_PROVIDER"] = "ollama"
+os.environ["JWT_SECRET_KEY"] = "test-secret-key-for-pytest-at-least-32-bytes-long"
 
 import pytest
 from fastapi.testclient import TestClient

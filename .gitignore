@@ -13,10 +13,17 @@ env/
 ENV/
 
 # ==================== 敏感配置 ====================
+# 忽略一切 .env 变体（.env / .env.local / .env.production / backend/.env.xxx），
+# 只放行模板文件（里面只有占位符）和前端的本地开发地址。
+# 之所以写成通配，是因为只写死 ".env" 挡不住 ".env.production" 这种变体。
 .env
+.env.*
+!.env.example
+!frontend/.env.development
 backend/.env
+backend/.env.*
 frontend/.env.local
-frontend/.env.production.local
+frontend/.env.*.local
 *.key
 *.pem
 
