@@ -1,14 +1,15 @@
-# 错题本 · Agentic AI 学习平台
+# 错题本 · 智能刷题系统
 
-> 一个可以自己出题、自动判分、自动收集错题，并用**本地大模型**讲题的刷题系统。
+> 一个可以自己出题、自动判分、自动收集错题，用**本地大模型**讲题，
+> 并按**知识点掌握度**决定下一题刷什么的刷题系统。
 > 前后端分离，数据全部留在自己机器上。
 
 <p>
-  <img alt="python" src="https://img.shields.io/badge/Python-3.11+-3776AB?logo=python&logoColor=white">
-  <img alt="fastapi" src="https://img.shields.io/badge/FastAPI-0.115-009688?logo=fastapi&logoColor=white">
+  <img alt="python" src="https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white">
+  <img alt="fastapi" src="https://img.shields.io/badge/FastAPI-0.143-009688?logo=fastapi&logoColor=white">
   <img alt="vue" src="https://img.shields.io/badge/Vue-3.5-4FC08D?logo=vuedotjs&logoColor=white">
   <img alt="mysql" src="https://img.shields.io/badge/MySQL-8.0-4479A1?logo=mysql&logoColor=white">
-  <img alt="redis" src="https://img.shields.io/badge/Redis-7-DC382D?logo=redis&logoColor=white">
+  <img alt="redis" src="https://img.shields.io/badge/Redis-5%2B-DC382D?logo=redis&logoColor=white">
   <img alt="docker" src="https://img.shields.io/badge/Docker-Compose-2496ED?logo=docker&logoColor=white">
 </p>
 
@@ -62,7 +63,7 @@ docker compose ps
 
 ### 方式二：本地开发模式（不用 Docker）
 
-需要本机已有 **Python 3.11+ / Node 22+ / MySQL 8**。
+需要本机已有 **Python 3.12（3.11+ 也可以） / Node 22+ / MySQL 8**。
 
 ```bash
 # 后端
@@ -158,6 +159,39 @@ npm run dev                                         # http://localhost:5173
 
 - 用 ECharts 展示答题量、正确率、错题分布等学习报告
 
+### 认知诊断与自适应选题
+
+系统不只用对错打分，还会**推断你每个知识点大概会到什么程度**，然后据此出题。
+
+- **模型**：BKT（贝叶斯知识追踪），四个参数 `p_init=0.30`、`p_learn=0.15`、
+  `p_slip=0.10`、`p_guess=0.25`。每答一题先按对错做贝叶斯后验，
+  再把后验向"学会了"方向迁移。纯数学实现（`backend/app/bkt.py`），不碰数据库，
+  所以能单独测——44 条测试盯着它的单调性、饱和值和边界。
+- **显示档位**：熟练 ≥0.90 / 基本掌握 ≥0.72 / 薄弱 ≥0.45 / 未掌握。
+  这几个数是按模型真实轨迹反推标定出来的（连对是
+  `0.30 → 0.666 → 0.896 → 0.973 → 0.99`），不是随手分的区间。
+- **选题策略**：`explore + 0.5 × exploit`
+  - `explore`（按练习次数衰减）保证没见过的知识点优先被覆盖；
+  - `exploit`（按错题数累加）保证错得多的知识点反复出现；
+  - 多个目标知识点之间轮转，不会一直卡在同一个知识点上刷。
+- **每道题都说明理由**：前端会显示"主考「加法运算」（掌握度 0.30 · 未掌握）"，
+  知识点题目不够时也会明说"用没做过的题补齐覆盖面"，而不是悄悄塞一道无关的题。
+- **交卷即反馈**：答题接口直接回传 `mastery_changes`，页面显示这道题让哪个
+  知识点涨了多少、有没有掉档。
+
+> **关于 BKT 的三个反直觉行为**（都写进了 `bkt.py` 的文档字符串，免得被当成 bug 改掉）：
+> 1. **一直答错不会掉到 0**，会稳定在 **0.173**。答错只能说明"这次没做对"，
+>    不能推断"永远不会"，这是有意的；
+> 2. **一直答对会饱和在 0.99**，连对四题就到顶。不是 1，保留"还会有意外"；
+> 3. **单个 `p_guess` 区分不了"真会"和"蒙对"**，对选择题偏乐观、对填空偏悲观。
+>    这是模型本身的已知上限，不是实现错误。
+>
+> 参数还必须满足 `1 - p_slip > p_guess` 才可辨识，`validate()` 会直接拒绝
+> 不合法的组合——否则"掌握度上升"可能只是参数自己编出来的。
+
+> **重置不等于删记录**：`DELETE /banks/{id}/mastery` 只把掌握度打回初始值，
+> 作答历史保留。诊断可以重来，但不会篡改"你确实做过这些题"这件事。
+
 ### 账号体系
 
 - 注册 / 登录 / JWT 鉴权 / 找回密码（验证码校验 + 一次性重置凭证）
@@ -169,19 +203,35 @@ npm run dev                                         # http://localhost:5173
 
 | 层 | 技术 | 说明 |
 |---|---|---|
-| 后端 | **Python 3.11 · FastAPI** | 原生异步框架，自动生成 OpenAPI 文档 |
+| 后端 | **Python 3.12 · FastAPI** | 原生异步框架，自动生成 OpenAPI 文档（代码兼容 3.11+） |
 | ORM | **SQLAlchemy 2.x · PyMySQL** | 声明式模型，启动时 `create_all` 自动建表 |
 | 数据库 | **MySQL 8** | `utf8mb4`，外键 `ON DELETE CASCADE` |
-| 缓存 | **Redis 7** | AI 解析结果缓存、题目列表缓存、防击穿分布式锁 |
+| 缓存 | **Redis（5.x 起可用）** | AI 解析结果缓存、题目列表缓存、防击穿分布式锁；显式走 RESP2，不用 Redis 6 才有的 `HELLO` |
 | 鉴权 | **PyJWT · bcrypt** | Bearer Token，`HTTPBearer` 依赖注入 |
 | 校验 | **Pydantic v2** | 请求体校验，统一 422 错误格式 |
 | 导入解析 | **openpyxl · python-docx · pdfplumber** | 分别解析 Excel / Word / PDF |
 | RAG 解析 | **pypdfium2 · pdfminer.six** | 讲义 PDF 双引擎解析 + 可读性闸门 |
 | RAG 检索 | **自实现 BM25(2-gram) + 余弦混合** | 不依赖分词词典和向量数据库 |
-| AI | **Ollama / 阿里云百炼** | 同一套接口，`LLM_PROVIDER` 切换；SSE 流式返回 |
+| 认知诊断 | **自实现 BKT** | 贝叶斯知识追踪，纯数学不依赖第三方库，可解释、可单测 |
+| AI | **Ollama / 阿里云百炼** | 同一套 OpenAI 兼容接口，`LLM_PROVIDER` 切换；SSE 流式返回 |
 | 前端 | **Vue 3 · TypeScript · Vite** | Composition API，`<script setup>` |
 | 图表 / 公式 | **ECharts · KaTeX** | 学习报告图表、数学公式渲染 |
 | 编排 | **Docker Compose · Nginx** | 四容器，Nginx 反代 + 静态托管 |
+
+<details>
+<summary><b>阿里云百炼这条路验证到哪一步了？</b></summary>
+
+代码里是完整实现：`LLM_PROVIDER=bailian` 时走 DashScope 的 OpenAI 兼容端点，
+切模型只改 `.env`。但**这条链路目前只跑通了单元测试，没有配真实 API Key 实测过**——
+压测和日常开发全部用的本地 Ollama。买 Key 之前请按下面这步先自检：
+
+```bash
+cd backend && python scripts/check_llm.py
+```
+
+它会打印当前 provider、模型名，并发一次真实请求；连不上会明确说是网络、
+Key 还是模型名的问题，而不是等到刷题时才报错。
+</details>
 
 <details>
 <summary><b>为什么用 PyMySQL 而不是 mysqlclient？</b></summary>
@@ -207,11 +257,13 @@ cuoti-notebook/
 │   │   ├── cache.py            # Redis 缓存层（降级、版本号失效、防击穿）
 │   │   ├── importer.py         # 四种格式的题目解析器
 │   │   ├── knowledge.py        # 知识点：打标提示词、解析、关联表写入
+│   │   ├── bkt.py              # 认知诊断模型（BKT），纯数学、不碰数据库
+│   │   ├── mastery.py          # 掌握度落库 / 自适应选题打分 / 补齐
 │   │   ├── llm.py              # 模型服务抽象：Ollama / 百炼 同一套接口
 │   │   ├── rag/                # 讲义解析 / 切分 / 向量化 / 混合检索
 │   │   ├── security.py         # JWT 密钥与算法（集中配置，生产环境缺密钥直接启动失败）
 │   │   ├── agent/              # ReAct 循环 + Function Calling 工具
-│   │   └── routes/             # auth / banks / import_questions / ai / rag / knowledge ...
+│   │   └── routes/             # auth / banks / import_questions / ai / rag / knowledge / mastery ...
 │   ├── tests/                  # pytest 接口测试
 │   ├── scripts/                # 数据集生成 + 压测 + 冒烟脚本
 │   ├── requirements.txt
@@ -245,11 +297,15 @@ Docker 用根目录 `.env`；本地开发用 `backend/.env`（完整列表见 `b
 | `AUTH_ECHO_CODE` | 开发 `1` / 生产 `0` | 是否把验证码放进 `/api/send-code` 响应里 |
 | `REDIS_URL` | `redis://127.0.0.1:6379/0` | 缓存地址，容器内是 `redis://redis:6379/0` |
 | `CACHE_DISABLED` | `0` | 设 `1` 彻底关闭缓存 |
+| `CACHE_PREFIX` | `cuoti` | 缓存 key 前缀，多环境共用一台 Redis 时用来隔离 |
+| `CACHE_TIMEOUT` | `0.1` | 单次 Redis 命令超时（秒），超时当作没缓存直接回源 |
 | `CACHE_EXPLAIN_TTL` | `86400` | AI 解析缓存时长（秒） |
 | `CACHE_QLIST_TTL` | `300` | 题目列表缓存时长（秒） |
+| `CACHE_WAIT_TIMEOUT` | `120` | 没抢到重建锁时最多等多久（秒）。**必须大于单次模型生成耗时**，否则防击穿退化成各请求都回源 |
+| `CACHE_LOCK_TTL` | `180` | 重建锁的 TTL（秒） |
 | `IMPORT_CHUNK_SIZE` | `500` | 导入时每多少条一个事务 |
 | `AI_API_BASE` | `http://localhost:11434` | Ollama 地址 |
-| `AI_MODEL` | `qwen2.5:7b` | 模型名，必须和 `ollama list` 里的一致 |
+| `AI_MODEL` | `qwen2.5:7b` | 模型名，必须和 `ollama list` 里的一致（实测用 `gemma3:4b`） |
 | `LLM_PROVIDER` | `ollama` | `ollama` 本地 / `bailian` 阿里云百炼 |
 | `EMBED_MODEL` | `bge-m3` | 本地向量模型，用之前要 `ollama pull bge-m3` |
 | `BAILIAN_API_KEY` | — | 百炼 key。**只写在 `.env` 里，不要提交、不要贴聊天** |
@@ -270,7 +326,7 @@ Docker 用根目录 `.env`；本地开发用 `backend/.env`（完整列表见 `b
 ```bash
 # 1. 安装 Ollama：https://ollama.com/download
 # 2. 拉一个模型（4B 左右在普通笔记本上够用）
-ollama pull qwen2.5:7b        # 或 gemma3:4b / llama3.2:3b，更省内存
+ollama pull qwen2.5:7b        # 代码里的默认值
 
 # 3. 确认服务在跑
 curl http://localhost:11434/api/tags
@@ -285,6 +341,11 @@ AI_MODEL=qwen2.5:7b
 
 改完重启后端：`docker compose restart backend`。
 
+> **本项目实测用的是 `gemma3:4b`**（约 3.3GB，压测、自动打标、认知诊断全链路都是它跑的），
+> `qwen2.5:7b` 只是代码默认值和通用推荐、本机没有实测。
+> 换模型只改 `AI_MODEL`，但**效果会变**——小模型在自动打标时会照抄提示词里的示例，
+> 代码里已经把示例的题号换成本批真实题号来兜住这个行为（见下方「知识点自动打标」）。
+
 > 容器访问宿主机的 Ollama 走 `host.docker.internal`。
 > 这个域名 Docker Desktop 自带；Linux 上本项目已经在 `docker-compose.yml`
 > 里用 `extra_hosts: host-gateway` 映射好了，不用再改。
@@ -293,23 +354,78 @@ AI_MODEL=qwen2.5:7b
 
 ## 📊 性能
 
-用 2 万题的题库做过一轮压测（单机，客户端和服务端在同一台机器上）：
+用 **2 万题**（20911 行）的题库压过一轮，单机、客户端和服务端在同一台机器上，
+所以绝对值偏悲观，看**相对变化**才有意义。
 
-| 场景 | 优化前 | 优化后 |
+### 真正解决问题的是分页，不是索引
+
+| 场景 | 改造前 | 改造后 |
 |---|---|---|
-| 题目列表接口 P95 | 18.4s / 8.1MB | 949ms / 8.5KB（命中缓存 66ms） |
-| AI 解析单次 | 19.2s | 30ms（命中缓存） |
-| 同题 5 并发模型调用 | 5 次 / 210s | 1 次 / 21.6s |
-| 含 8% 脏行的 1000 题导入 | 0%（整包失败） | 91.9%（附错误清单） |
+| 整包返回（`list_all`）P95 | 18.4s / 8.1MB | **20.3s / 8.1MB** |
+| 分页取 20 条（`list_page20`）P95 | — | 949ms（冷）/ **66ms**（热）· 8.5KB |
 
-主要手段：**游标分页 + 联合索引 + Redis 内容缓存（版本号失效）+ `SET NX` 防击穿**。
-脚本在 `backend/scripts/`，可以自己复现：
+**这里必须说清楚：整包接口并没有变快**（18.4s → 20.3s，同一个 8.1MB 响应体，
+波动范围内）。改造后的价值和代价是分开的：
+
+- 值的地方：前端原来一进题库页就拉 8MB，现在按页拉 8.5KB，**体积降到 1/956**。
+  另一次同库实测：整包 2040ms / 8236.9KB，一页 50 条 12ms / 15.4KB（1/535）。
+- 代价：**只要还有客户端去拉整包，它一样是 20 秒**。接口没有变快，
+  只是前端不再那么用了。真要让整包也变快，得改成游标分页 + 强制 `limit` 上限。
+
+为什么加索引救不了整包：整包是 **CPU 密集**的——单请求 1585ms，
+10 并发 P95 掉到 16547ms（GIL 下序列化 2 万个 ORM 对象），
+瓶颈不在索引，而在"把 2 万行变成 JSON"这件事本身。
+
+### AI 解析缓存
+
+| 场景 | 改造前 | 改造后 |
+|---|---|---|
+| 命中缓存 P95 | 118.0s | **33ms** |
+| 冷启动单次（本地 gemma3:4b） | — | 约 25 ~ 28s |
+
+改造前没有缓存，同一个问题问几遍就调几遍模型（一次 20 秒以上）。
+现在缓存 key 里带**题目内容哈希 + 用户答案哈希 + 本次检索到的片段 id**，
+题目内容一改 key 就变，不需要手动失效，也不会拿旧引用回答新知识库。
+
+### 防击穿锁的边界（一个没做完美的点）
+
+同题 5 并发，**默认配置**下锁生效了：1 次模型调用 / 25.2s，另外 4 个命中缓存。
+
+但这个机制不是无条件的。等待方最多等 `CACHE_WAIT_TIMEOUT`（默认 120s），
+超时就放弃并各自回源。把窗口压到 8s 复现一次：
+
+| 等待窗口 | 模型调用次数 | 墙钟时间 |
+|---|---|---|
+| 120s（默认） | 1 次 | 25.2s |
+| 8s | 5 次 | 144.4s |
+
+也就是说：**首次生成必须在等待窗口内完成，锁才成立**。本地模型 5 并发抢 CPU 时
+单次能拖到 200 秒以上，这时等待方全部超时，防击穿退化成"5 个请求各调一次模型"。
+更稳的做法是等待方超时后**继续等**（而不是回源），或者把窗口按模型实测耗时配置；
+现在的实现选择了"宁可直接回源也不让用户干等"。
+
+### 导入容错
+
+1000 题、其中 8% 是脏数据（缺选项、答案不在选项里、题型非法等 5 类）：
+
+| 版本 | 结果 |
+|---|---|
+| 改造前 | **整包失败**，0 行入库，只报一条错 |
+| 改造后 | 911 行入库 / 80 行失败 / 9 行去重，失败行**逐条附原因** |
+
+### 复现
 
 ```bash
 cd backend
 python scripts/seed_data.py --questions 20000      # 造数据集
 python scripts/bench_api.py --base-url http://127.0.0.1:3000 --bank-id 1
+
+# 分页 / 服务端搜索 / 计数：这个脚本打的是 3002（bench 库），
+# 地址用环境变量 BASE 覆盖
+BASE=http://127.0.0.1:3002 python scripts/bench_questions_api.py
 ```
+
+`bench_questions_api.py` 顶部注释里记着本机实测数字，改完代码可以直接对照重跑。
 
 ---
 
@@ -321,8 +437,9 @@ pip install -r requirements.txt
 pytest -q
 ```
 
-共 **238 个**接口测试，覆盖认证与账号安全、题库 CRUD、答题判分、越权访问、
-批量导入、分页与缓存一致性、RAG 解析与混合检索、知识点打标。
+共 **325 个**后端测试，覆盖认证与账号安全、题库 CRUD、答题判分、越权访问、
+批量导入、分页与缓存一致性、RAG 解析与混合检索、知识点打标、
+以及认知诊断（BKT）与自适应选题（其中 BKT 44 条、诊断接口 32 条）。
 测试用 SQLite 内存库，不会污染你的 MySQL。
 
 另有一个**需要真实后端在跑**的端到端冒烟脚本，把前端页面用到的知识库接口
@@ -388,6 +505,45 @@ python scripts/smoke_knowledge_api.py --base-url http://127.0.0.1:3000
 Nginx 默认只允许 1MB 请求体。本项目 `frontend/nginx.conf` 里已经设了
 `client_max_body_size 20m`（图片限制 5MB、导入限制 10MB）。
 如果你用的是自己的 Nginx，记得同步这个配置。
+</details>
+
+<details>
+<summary><b>掌握度全是 0.30、自适应选题说「没有可用知识点」</b></summary>
+
+这是**正常现象**，不是 bug：诊断的对象是知识点，而知识点要先打标才有。
+
+1. 进题库页 → 「知识点」区域 → 点自动打标（先 `dry_run` 看提示词也行）；
+2. 或者进 `/knowledge` 页面批量打标。
+
+题目一个知识点都没有时，自适应选题会退化成"按题号顺序出没做过的题"
+（接口里明确返回 `strategy=fallback_no_kp`），不会假装在诊断。
+另外跑批用的是本地模型，**1 批 10 题约 20 秒，2 万题全量约 12 小时**，
+先用 `TAG_BATCH_SIZE` 或页面上的数量上限小范围试。
+</details>
+
+<details>
+<summary><b>自动打标报「没有解析出有效知识点」</b></summary>
+
+错误信息里会带上**模型实际返回的题号**，先看这个。最常见的原因是模型
+（尤其是 4B 这种小模型）把提示词示例里的题号照抄了回来，导致每条都被
+"题号不在本批"丢掉。代码里已经把示例题号换成本批真实题号，
+如果你的老版本还会这样，先确认 `backend/app/knowledge.py` 是最新的。
+
+另一个可能是整批输出不是 JSON（模型跑偏了），这时把模型换大一点，
+或者把 `TAG_BATCH_SIZE` 调小。
+</details>
+
+<details>
+<summary><b>老库升级后报缺表 / 查询很慢</b></summary>
+
+`create_all` 只会**新建缺失的表**，不会给已存在的表补索引。
+- 新功能需要的表（知识点、讲义、掌握度）启动时会自动建好；
+- 但**索引不会自动补**。老库请手工执行缺的 `ALTER TABLE ... ADD INDEX`，
+  否则掌握度/统计这类查询会走全表扫描。
+
+另外 `create_all` 不会改已有列的类型：`selected_answer` 在旧库里可能是
+`varchar(255)`，存长答案会被截断（模型里声明的是 `String(255)`，
+本地库实际是 `varchar(500)`）。
 </details>
 
 <details>
