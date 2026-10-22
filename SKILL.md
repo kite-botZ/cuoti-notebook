@@ -1,4 +1,4 @@
----
+﻿---
 name: cuoti-notebook
 description: 错题本/刷题宝项目的开发约定。涉及 FastAPI 后端、Vue3 前端、MySQL 数据模型、JWT 认证、题库/题目/答题/错题本、知识点打标与 RAG、认知诊断（BKT）与自适应选题相关改动时使用。
 ---
@@ -39,8 +39,8 @@ AI 讲解，并基于 BKT 掌握度做自适应选题。
           rag.py                  检索调试接口
           mastery.py              掌握度总览 / 自适应选题 / 重置
           daily.py, user.py       每日一练、用户设置
-      tests/                      13 个 test_*.py，340 条用例
-      scripts/                    造数据、压测、冒烟、连通性自检
+      tests/                      13 个 test_*.py，344 条用例
+      scripts/                    造数据、压测、冒烟、连通性自检、老库升级
       run.py                      启动脚本（uvicorn）
       requirements.txt
 
@@ -150,6 +150,15 @@ bcrypt、MySQL 8、Redis（5.x 起可用，显式走 RESP2）
 - 改 BKT / 选题逻辑时必须同时改 `test_bkt.py` / `test_mastery_api.py`：
   这两个文件里的断言是照真实数值写的，改了模型就会红，**先确认是模型错了还是断言错了**，
   不要直接把断言改松
+
+## 数据库变更约定
+
+- 新表直接加模型，应用启动时 `create_all` 会建（含索引）
+- **给已有表加索引，`create_all` 不会补**。加完模型里的 `Index(...)` 之后，
+  老库要跑 `python scripts/upgrade_db.py --apply`（幂等，已存在的会跳过）；
+  这个脚本连的是 `.env` 里配的库，**对生产库先不带 `--apply` 预览**
+- 改已有列的类型/名字 `create_all` 也不会做，要手工 `ALTER`，
+  并且要想清楚老数据怎么办（比如 `selected_answer` 长度）
 
 ## 常见任务套路
 
