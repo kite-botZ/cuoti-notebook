@@ -5,6 +5,10 @@ __pycache__/
 *.egg-info/
 .pytest_cache/
 .mypy_cache/
+# pytest 的临时目录：tmp_path fixture 建的库文件会落在这里。
+# basetemp 默认跟当前工作目录走，所以从 backend/ 里跑 pytest 就会生成它。
+pytest-of-*/
+.pytest_tmp/
 
 # ==================== 虚拟环境 ====================
 venv/
