@@ -24,13 +24,13 @@
       <button
         class="all-practice"
         type="button"
-        :disabled="normalQuestions.length === 0"
+        :disabled="stats.normal === 0"
         @click="startPractice('sequential')"
       >
         <span class="play-icon">▶</span>
         <span>
           <strong>开始顺序练习</strong>
-          <small>从第 1 题开始，完成全部 {{ normalQuestions.length }} 道题</small>
+          <small>从第 1 题开始，完成全部 {{ stats.normal }} 道题</small>
         </span>
         <i>→</i>
       </button>
@@ -42,28 +42,28 @@
             <p class="eyebrow">MY COLLECTION</p>
             <h2>题库内容</h2>
           </div>
-          <span>{{ questions.length }} 道题目</span>
+          <span>{{ stats.total }} 道题目</span>
         </div>
         <div class="feature-grid">
-          <button type="button" class="feature-card wrong" :disabled="wrongQuestions.length === 0" @click="startPractice('wrong')">
+          <button type="button" class="feature-card wrong" :disabled="stats.wrong === 0" @click="startPractice('wrong')">
             <span class="feature-icon">×</span>
             <strong>我的错题</strong>
-            <small>{{ wrongQuestions.length }} 道待巩固</small>
+            <small>{{ stats.wrong }} 道待巩固</small>
           </button>
-          <button type="button" class="feature-card favorite" :disabled="favoriteQuestions.length === 0" @click="startPractice('favorite')">
+          <button type="button" class="feature-card favorite" :disabled="stats.favorite === 0" @click="startPractice('favorite')">
             <span class="feature-icon">★</span>
             <strong>我的收藏</strong>
-            <small>{{ favoriteQuestions.length }} 道重点题</small>
+            <small>{{ stats.favorite }} 道重点题</small>
           </button>
-          <button type="button" class="feature-card cut" :disabled="cutQuestions.length === 0" @click="openCutDialog">
+          <button type="button" class="feature-card cut" :disabled="stats.cut === 0" @click="openCutDialog">
             <span class="feature-icon">✂</span>
             <strong>我的斩题</strong>
-            <small>{{ cutQuestions.length }} 道已移出练习</small>
+            <small>{{ stats.cut }} 道已移出练习</small>
           </button>
-          <button type="button" class="feature-card note" :disabled="noteQuestions.length === 0" @click="showNotes = true">
+          <button type="button" class="feature-card note" :disabled="stats.note === 0" @click="openNotes">
             <span class="feature-icon">✎</span>
             <strong>我的笔记</strong>
-            <small>{{ noteQuestions.length }} 条学习笔记</small>
+            <small>{{ stats.note }} 条学习笔记</small>
           </button>
         </div>
       </section>
@@ -102,23 +102,23 @@
           </div>
         </div>
         <div class="practice-grid">
-          <button type="button" :disabled="normalQuestions.length === 0" @click="startPractice('sequential')">
+          <button type="button" :disabled="stats.normal === 0" @click="startPractice('sequential')">
             <span class="method-icon green">≡</span>
             <strong>顺序练习</strong>
             <small>按题库顺序逐题完成</small>
-            <em>{{ normalQuestions.length }} 题</em>
+            <em>{{ stats.normal }} 题</em>
           </button>
-          <button type="button" :disabled="normalQuestions.length === 0" @click="startPractice('random')">
+          <button type="button" :disabled="stats.normal === 0" @click="startPractice('random')">
             <span class="method-icon blue">⌘</span>
             <strong>随机练习</strong>
             <small>随机抽取，避免记住顺序</small>
-            <em>{{ normalQuestions.length }} 题</em>
+            <em>{{ stats.normal }} 题</em>
           </button>
-          <button type="button" :disabled="normalQuestions.length === 0" @click="startPractice('sequential')">
+          <button type="button" :disabled="stats.normal === 0" @click="startPractice('sequential')">
             <span class="method-icon orange">☷</span>
             <strong>全部题目</strong>
             <small>从第一题开始刷整库</small>
-            <em>{{ normalQuestions.length }} 题</em>
+            <em>{{ stats.normal }} 题</em>
           </button>
         </div>
       </section>
@@ -129,10 +129,18 @@
           <div>
             <p class="eyebrow">QUESTION LIST</p>
             <h2>全部题目</h2>
-            <p>{{ visibleQuestions.length }} 道题目；已斩题不会进入常规练习。</p>
+            <p>
+              <template v-if="query">
+                搜索命中 {{ matched }} 道，已加载 {{ questions.length }} 道
+              </template>
+              <template v-else>
+                共 {{ stats.total }} 道，已加载 {{ questions.length }} 道
+              </template>
+              ；已斩题不会进入常规练习。
+            </p>
           </div>
           <div class="manager-actions">
-            <input v-model.trim="query" type="search" placeholder="搜索题目或知识点" />
+            <input v-model.trim="query" type="search" placeholder="搜索题干或笔记（服务端搜索）" />
             <button type="button" class="outline-button" :disabled="!visibleQuestions.length" @click="toggleSelectAll">
               {{ allSelected ? '取消全选' : '全选' }}
             </button>
@@ -194,9 +202,24 @@
         </div>
 
         <div v-else class="empty-questions">
-          <strong>还没有匹配的题目</strong>
-          <p>可以新增题目、批量导入，或调整搜索内容。</p>
+          <strong>{{ query ? '没有匹配的题目' : '这个题库还没有题目' }}</strong>
+          <p>{{ query ? '换个关键词再试，搜索会覆盖整个题库。' : '可以新增题目或批量导入。' }}</p>
         </div>
+
+        <!-- 加载更多：题库里可能有两万道题，一次只取一页 -->
+        <div v-if="hasMore" class="load-more-bar">
+          <button
+            type="button"
+            class="outline-button load-more-btn"
+            :disabled="loadingMore"
+            @click="loadMore"
+          >
+            {{ loadingMore ? '加载中…' : `加载更多（已显示 ${questions.length} / ${matched}）` }}
+          </button>
+        </div>
+        <p v-else-if="questions.length" class="load-more-end">
+          已经到底了，共 {{ questions.length }} 道。
+        </p>
       </section>
     </section>
 
@@ -216,7 +239,9 @@
           </div>
           <button type="button" @click="showNotes = false">关闭</button>
         </div>
-        <div v-for="question in noteQuestions" :key="question.id" class="note-item">
+        <p v-if="notesLoading" class="note-empty">正在加载笔记…</p>
+        <p v-else-if="!noteList.length" class="note-empty">还没有写过笔记。</p>
+        <div v-for="question in noteList" :key="question.id" class="note-item">
           <strong>{{ plainStem(question.stem) }}</strong>
           <p>{{ question.note }}</p>
         </div>
@@ -488,9 +513,9 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import request from '@/api/request'
+import request, { getPage } from '@/api/request'
 import { toast } from '@/composables/useToast'
 
 const letters = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H']
@@ -525,9 +550,36 @@ const uploadingAnswer = ref(false)
 const bank = ref<Bank | null>(null)
 const questions = ref<Question[]>([])
 
+// ==================== 分页 ====================
+//
+// 题库里可能有两万道题。v1 一次性把全部题目拉回来，后端要实例化两万行 ORM 对象
+// 再序列化成 8MB JSON —— 实测单请求 1.6 秒，而这段是 CPU 密集的，GIL 下并发
+// 完全无效：10 个并发请求每个都要 16 秒。
+//
+// 所以列表改成「一页 50 条 + 加载更多」。代价是前端手里只有一页数据，
+// 「我的错题有几道」这类数字算不出来，必须走 /question-stats 由服务端给。
+const PAGE_SIZE = 50
+const page = ref(1)
+const hasMore = ref(false)
+const loadingMore = ref(false)
+// 当前筛选条件下服务端一共有多少条（带搜索词时是命中数）
+const matched = ref(0)
+
+const stats = ref({
+  total: 0,
+  normal: 0,
+  cut: 0,
+  wrong: 0,
+  favorite: 0,
+  note: 0,
+  by_type: {} as Record<string, number>,
+})
+
 const query = ref('')
 const selectedIds = ref<number[]>([])
 const showNotes = ref(false)
+const noteList = ref<Question[]>([])
+const notesLoading = ref(false)
 const showQuestionDialog = ref(false)
 
 const editingId = ref<number | null>(null)
@@ -559,16 +611,12 @@ const cutSelectedIds = ref<number[]>([])
 const restoringBatch = ref(false)
 
 // ==================== 计算 ====================
+//
+// 分类计数**不再从 questions 数组里过滤**：分页之后那里只有一个页的题。
+// 数字全部来自 /question-stats（服务端一次聚合算完），口径和之前完全一致
+// （斩题不算进错题/收藏，笔记不受斩题影响）。
 
-const normalQuestions = computed(() => questions.value.filter(q => !q.is_cut))
-const wrongQuestions = computed(() => questions.value.filter(q => q.wrong_count > 0 && !q.is_cut))
-const favoriteQuestions = computed(() => questions.value.filter(q => q.is_favorite && !q.is_cut))
-const cutQuestions = computed(() => questions.value.filter(q => q.is_cut))
-const noteQuestions = computed(() => questions.value.filter(q => q.note && q.note.length > 0))
-
-const visibleQuestions = computed(() =>
-  questions.value.filter(q => plainStem(q.stem).includes(query.value) || q.note.includes(query.value))
-)
+const visibleQuestions = computed(() => questions.value)
 
 const allSelected = computed(() =>
   visibleQuestions.value.length > 0 &&
@@ -588,27 +636,21 @@ const allTypes = [
   { value: 'calc', label: '计算题' },
 ]
 
-// 分题型：有图的题归入"看图题"，不出现在原题型里
-const typeList = computed(() => {
-  const imageQuestions = normalQuestions.value.filter(q => hasImage(q.stem))
-  const plainQuestions = normalQuestions.value.filter(q => !hasImage(q.stem))
+// 分题型：有图的题归入"看图题"，不出现在原题型里。
+// 计数来自服务端聚合（同一个口径：只看非斩题的题）。
+const TYPE_META = [
+  { key: 'single', label: '单选题', desc: '单项选择' },
+  { key: 'multiple', label: '多选题', desc: '多项选择' },
+  { key: 'judge', label: '判断题', desc: '对或错' },
+  { key: 'blank', label: '填空题', desc: '填写答案' },
+  { key: 'short', label: '简答题', desc: '文字作答' },
+  { key: 'calc', label: '计算题', desc: '计算过程' },
+  { key: 'image', label: '看图题', desc: '题干含图片' },
+]
 
-  const base = [
-    { key: 'single', label: '单选题', desc: '单项选择' },
-    { key: 'multiple', label: '多选题', desc: '多项选择' },
-    { key: 'judge', label: '判断题', desc: '对或错' },
-    { key: 'blank', label: '填空题', desc: '填写答案' },
-    { key: 'short', label: '简答题', desc: '文字作答' },
-    { key: 'calc', label: '计算题', desc: '计算过程' },
-    { key: 'image', label: '看图题', desc: '题干含图片' },
-  ]
-  return base.map(t => {
-    const count = t.key === 'image'
-      ? imageQuestions.length
-      : plainQuestions.filter(q => q.question_type === t.key).length
-    return { ...t, count }
-  })
-})
+const typeList = computed(() =>
+  TYPE_META.map(t => ({ ...t, count: stats.value.by_type[t.key] || 0 }))
+)
 
 // ==================== 工具 ====================
 
@@ -661,17 +703,75 @@ async function loadBank() {
   }
 }
 
+async function loadStats() {
+  try {
+    // 分页之后各种计数只能由服务端给；顺手也保证总数和列表用的是同一份口径
+    stats.value = await request.get(
+      `/banks/${bankId}/question-stats`
+    ) as unknown as typeof stats.value
+  } catch (e: any) {
+    // 计数失败不该让整页打不开，列表还是能看的
+    toast.error(e.message || '题目统计加载失败')
+  }
+}
+
+/** 取某一页。`replace=true` 用于切换搜索词：从头开始，丢掉旧结果。 */
+async function fetchPage(target: number, replace: boolean) {
+  const params: Record<string, unknown> = { page: target, page_size: PAGE_SIZE }
+  if (query.value) params.q = query.value
+
+  // 用 getPage 而不是 request.get：需要读 X-Total-Count / X-Has-More，
+  // 只按"这页够不够 50 条"判断会在总数正好是 50 的倍数时多点一次空页。
+  const { items, total, hasMore: more } = await getPage<Question[]>(
+    `/banks/${bankId}/questions`, params
+  )
+
+  questions.value = replace ? items : [...questions.value, ...items]
+  page.value = target
+  hasMore.value = more
+  matched.value = total
+  if (replace) selectedIds.value = []
+}
+
 async function loadQuestions() {
   try {
-    questions.value = await request.get(`/banks/${bankId}/questions`) as unknown as Question[]
+    await fetchPage(1, true)
   } catch (e: any) {
     toast.error(e.message || '题目加载失败')
   }
 }
 
+async function loadMore() {
+  if (loadingMore.value || !hasMore.value) return
+  loadingMore.value = true
+  try {
+    await fetchPage(page.value + 1, false)
+  } catch (e: any) {
+    toast.error(e.message || '加载更多失败')
+  } finally {
+    loadingMore.value = false
+  }
+}
+
+// 搜索改成**服务端**搜索：分页之后在本地过滤就只能搜到已加载的这几页，
+// 那是错的。输入停顿 300ms 再发请求，避免逐字敲时打一串请求。
+let searchTimer: number | undefined
+watch(query, () => {
+  window.clearTimeout(searchTimer)
+  searchTimer = window.setTimeout(async () => {
+    try {
+      await fetchPage(1, true)
+    } catch (e: any) {
+      toast.error(e.message || '搜索失败')
+    }
+  }, 300)
+})
+
+onBeforeUnmount(() => window.clearTimeout(searchTimer))
+
 async function loadAll() {
   loading.value = true
-  await Promise.all([loadBank(), loadQuestions()])
+  await Promise.all([loadBank(), loadStats(), loadQuestions()])
   loading.value = false
 }
 
@@ -704,6 +804,8 @@ async function toggleFavorite(id: number) {
     const res = await request.post(`/questions/${id}/favorite`) as unknown as { is_favorite: boolean }
     const target = questions.value.find(q => q.id === id)
     if (target) target.is_favorite = res.is_favorite
+    // 收藏数现在由服务端算，本地改了状态就得让服务端重算一次
+    await loadStats()
   } catch (e: any) {
     toast.error(e.message || '操作失败')
   }
@@ -714,6 +816,7 @@ async function toggleCut(id: number) {
     const res = await request.post(`/questions/${id}/cut`) as unknown as { is_cut: boolean }
     const target = questions.value.find(q => q.id === id)
     if (target) target.is_cut = res.is_cut
+    await loadStats()
   } catch (e: any) {
     toast.error(e.message || '操作失败')
   }
@@ -733,8 +836,7 @@ async function batchCut(shouldCut: boolean) {
     ) as unknown as { message: string }
     toast.success(res.message)
     selectedIds.value = []
-    await loadQuestions()
-    await loadBank()
+    await Promise.all([loadQuestions(), loadStats(), loadBank()])
   } catch (e: any) {
     toast.error(e.message || '操作失败')
   } finally {
@@ -751,7 +853,7 @@ async function confirmDeleteQuestion(question: Question) {
   try {
     await request.delete(`/questions/${question.id}`)
     questions.value = questions.value.filter(q => q.id !== question.id)
-    await loadBank()
+    await Promise.all([loadStats(), loadBank()])
     toast.success('题目已删除')
   } catch (e: any) {
     toast.error(e.message || '删除失败')
@@ -954,12 +1056,29 @@ async function saveQuestion() {
 
     showQuestionDialog.value = false
     editingId.value = null
-    await loadQuestions()
-    await loadBank()
+    await Promise.all([loadQuestions(), loadStats(), loadBank()])
   } catch (e: any) {
     toast.error(e.message || '保存失败')
   } finally {
     saving.value = false
+  }
+}
+
+// ==================== 笔记弹窗 ====================
+
+async function openNotes() {
+  showNotes.value = true
+  noteList.value = []
+  notesLoading.value = true
+  try {
+    // 列表页只加载了一页，这里按 filter_type=note 单独取一次全量笔记
+    noteList.value = await request.get(
+      `/banks/${bankId}/questions?filter_type=note`
+    ) as unknown as Question[]
+  } catch (e: any) {
+    toast.error(e.message || '笔记加载失败')
+  } finally {
+    notesLoading.value = false
   }
 }
 
@@ -983,8 +1102,7 @@ async function restoreFromDialog(id: number) {
     await request.post(`/questions/${id}/cut`)
     cutList.value = cutList.value.filter(q => q.id !== id)
     cutSelectedIds.value = cutSelectedIds.value.filter(x => x !== id)
-    await loadQuestions()
-    await loadBank()
+    await Promise.all([loadQuestions(), loadStats(), loadBank()])
     toast.success('已恢复')
   } catch (e: any) {
     toast.error(e.message || '恢复失败')
@@ -1018,8 +1136,7 @@ async function restoreSelectedCut() {
     toast.success(res.message)
     cutSelectedIds.value = []
     await refreshCutList()
-    await loadQuestions()
-    await loadBank()
+    await Promise.all([loadQuestions(), loadStats(), loadBank()])
   } catch (e: any) {
     toast.error(e.message || '恢复失败')
   } finally {
@@ -1041,8 +1158,7 @@ async function restoreAllCut() {
     toast.success(res.message)
     cutSelectedIds.value = []
     await refreshCutList()
-    await loadQuestions()
-    await loadBank()
+    await Promise.all([loadQuestions(), loadStats(), loadBank()])
   } catch (e: any) {
     toast.error(e.message || '恢复失败')
   } finally {
@@ -1072,28 +1188,36 @@ function practiceOneCut(question: { id: number }) {
 }
 
 function startPractice(source: 'sequential' | 'random' | 'wrong' | 'favorite' | 'cut' | 'selected') {
-  const listMap: Record<string, Question[]> = {
-    sequential: normalQuestions.value,
-    random: normalQuestions.value,
-    wrong: wrongQuestions.value,
-    favorite: favoriteQuestions.value,
-    cut: cutQuestions.value,
-    selected: normalQuestions.value.filter(q => selectedIds.value.includes(q.id)),
+  // 只有 selected 需要"我勾了哪几道题"这份名单，它是从当前已加载的页里勾的，
+  // 传 ids 是准确的。
+  //
+  // 其余 source 不用传名单：Practice.vue 会自己按 source 去后端取整套题
+  // （wrong / favorite / cut 走 filter_type，type 走 question_type）。
+  // 以前这里把整个名单都塞进 sessionStorage，其实只有在 selected 时被读到，
+  // 顺序练习那一支等于白写两万个 id；分页之后更会变成"只传当前页"，
+  // 一旦 Practice.vue 将来真的去读它，就会静默地把练习范围缩小成 50 题。
+  if (source === 'selected') {
+    const list = questions.value.filter(q => selectedIds.value.includes(q.id))
+    if (!list.length) return
+    sessionStorage.setItem('practice-selection', JSON.stringify(list.map(q => q.id)))
+  } else if (source !== 'sequential' && source !== 'random') {
+    // wrong / favorite / cut：后端取全集，这里只需要确认非空
+    const count = { wrong: stats.value.wrong, favorite: stats.value.favorite, cut: stats.value.cut }[source]
+    if (!count) return
+  } else if (!stats.value.normal) {
+    return
   }
-  const list = listMap[source]
-  if (!list.length) return
 
-  sessionStorage.setItem('practice-selection', JSON.stringify(list.map(q => q.id)))
   router.push({ path: '/practice', query: { bank: bankId, source } })
 }
 
 function startPracticeByType(key: string) {
+  // image 这一支也由 Practice.vue 自己拉全量再过滤，不需要名单
   if (key === 'image') {
-    const list = normalQuestions.value.filter(q => hasImage(q.stem))
-    if (!list.length) return
-    sessionStorage.setItem('practice-selection', JSON.stringify(list.map(q => q.id)))
+    if (!stats.value.by_type.image) return
     router.push({ path: '/practice', query: { bank: bankId, source: 'image' } })
   } else {
+    if (!stats.value.by_type[key]) return
     router.push({ path: '/practice', query: { bank: bankId, source: 'type', qtype: key } })
   }
 }
@@ -1141,8 +1265,7 @@ async function submitImport() {
     ) as unknown as { message: string; imported: number }
     importSuccess.value = res.message
     importFile.value = null
-    await loadQuestions()
-    await loadBank()
+    await Promise.all([loadQuestions(), loadStats(), loadBank()])
     toast.success(res.message)
     setTimeout(() => closeImport(), 900)
   } catch (e: any) {
@@ -1261,6 +1384,12 @@ function downloadJsonTemplate() {
 .empty-questions { margin-top: 18px; padding: 60px 20px; border: 1px solid #e1e9e4; text-align: center; background: #fff; }
 .empty-questions strong { color: #43564c; }
 .empty-questions p { color: #85928b; font-size: 13px; }
+
+/* 加载更多 */
+.load-more-bar { margin-top: 16px; text-align: center; }
+.load-more-btn { padding: 11px 26px; }
+.load-more-end { margin: 16px 0 0; color: #9aa7a1; font-size: 12px; text-align: center; }
+.note-empty { color: #85928b; font-size: 13px; }
 .question-modal label { display: block; margin: 16px 0 8px; color: #47594f; font-size: 13px; font-weight: 600; }
 .question-modal input, .question-modal select, .question-modal textarea { width: 100%; border: 1px solid #d8e4de; border-radius: 8px; padding: 10px; color: #33473d; background: #fff; outline: none; box-sizing: border-box; font-family: inherit; }
 .question-modal textarea { min-height: 72px; resize: vertical; }

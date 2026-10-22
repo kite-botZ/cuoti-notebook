@@ -285,3 +285,226 @@ def test_multiple_choice_answer_is_stored_verbatim(client, auth_headers, created
     attempt = db.query(AnswerAttempt).filter(AnswerAttempt.question_id == qid).first()
     assert db.query(AnswerAttempt).count() == 1
     assert attempt.selected_answer == "CA"
+
+
+# ============================================================
+# 服务端搜索（分页之后，客户端过滤只能搜到当前页，所以必须回源）
+# ============================================================
+
+def test_search_finds_question_outside_current_page(client, auth_headers, created_bank):
+    """关键回归：目标题在很后面，但 page=1 的搜索请求也必须能搜到。
+
+    分页之前前端是在已加载的全量数组上过滤的，所以"搜得到"。
+    分页之后如果还留在客户端过滤，就只能搜到当前页——这条用例盯着这个回归。
+    """
+    bank_id = created_bank["id"]
+    bulk_import(client, bank_id, auth_headers, 30)
+
+    # 单页只放 5 条，目标题（第 1 题，id 最小、倒序排在最后）落在第 6 页
+    near = client.get(
+        f"/api/banks/{bank_id}/questions?page=1&page_size=5", headers=auth_headers
+    ).json()
+    assert not any("第 1 题" in q["stem"] for q in near), "前置条件：目标题不在第 1 页"
+
+    resp = client.get(
+        f"/api/banks/{bank_id}/questions"
+        "?page=1&page_size=5&q=" + "分页测试第 1 题",
+        headers=auth_headers,
+    )
+    assert resp.status_code == 200
+    hits = resp.json()
+    assert len(hits) == 1, f"应该只命中 1 条，实际 {len(hits)}"
+    assert hits[0]["stem"] == "分页测试第 1 题"
+    assert resp.headers["X-Total-Count"] == "1", "总数应该是过滤后的数量"
+
+
+def test_search_matches_note(client, auth_headers, created_bank):
+    bank_id = created_bank["id"]
+    bulk_import(client, bank_id, auth_headers, 3)
+    target = client.get(
+        f"/api/banks/{bank_id}/questions?page=1&page_size=5", headers=auth_headers
+    ).json()[0]
+
+    client.put(
+        f"/api/questions/{target['id']}/note",
+        json={"note": "这里我老是记错符号"},
+        headers=auth_headers,
+    )
+
+    hits = client.get(
+        f"/api/banks/{bank_id}/questions?q=老是记错", headers=auth_headers
+    ).json()
+    assert [q["id"] for q in hits] == [target["id"]]
+
+
+def test_search_escapes_like_wildcards(client, auth_headers, created_bank):
+    """搜 `%` 不能变成"匹配所有题"。"""
+    bank_id = created_bank["id"]
+    bulk_import(client, bank_id, auth_headers, 5)
+    client.post(
+        f"/api/banks/{bank_id}/questions",
+        json={"stem": "命中率 50% 是多少", "question_type": "blank",
+              "options": [], "correct_answer": "0.5", "explanation": ""},
+        headers=auth_headers,
+    )
+
+    hits = client.get(
+        f"/api/banks/{bank_id}/questions?q=" + "50%", headers=auth_headers
+    ).json()
+    assert [q["stem"] for q in hits] == ["命中率 50% 是多少"], \
+        f"% 没转义的话会匹配到全部 6 条，实际 {len(hits)} 条"
+
+    # 下划线同理：`_` 在 LIKE 里是"任意一个字符"
+    hits = client.get(
+        f"/api/banks/{bank_id}/questions?q=" + "第_题", headers=auth_headers
+    ).json()
+    assert hits == [], "没有任何题干含字面量下划线，`_` 必须被当作普通字符"
+
+
+@pytest.mark.skipif(not cache.enabled, reason="需要可用的 Redis")
+def test_search_bypasses_cache(client, auth_headers, created_bank):
+    """搜索请求完全不碰缓存层。
+
+    注意这里断言的是 hit/miss **都不动**，而不是"第二次还 miss"：
+    搜索路径直接走回源分支，压根没调用 cache.get_json，
+    所以连 miss 都不会记一次。
+    """
+    bank_id = created_bank["id"]
+    bulk_import(client, bank_id, auth_headers, 3)
+    url = f"/api/banks/{bank_id}/questions?page=1&page_size=20&q=分页"
+
+    cache.reset_stats()
+    client.get(url, headers=auth_headers)
+    first = cache.stats()
+    client.get(url, headers=auth_headers)
+    second = cache.stats()
+
+    assert first["hit"] == 0 and first["miss"] == 0, f"搜索不该读写缓存：{first}"
+    assert second["hit"] == 0 and second["miss"] == 0, f"搜索不该读写缓存：{second}"
+
+    # 反过来验证对照组：同一条 URL 去掉 q 之后，第二次就该命中缓存了，
+    # 否则上面那条断言可能只是因为缓存整个没生效。
+    plain = f"/api/banks/{bank_id}/questions?page=1&page_size=20"
+    cache.reset_stats()
+    client.get(plain, headers=auth_headers)
+    client.get(plain, headers=auth_headers)
+    assert cache.stats()["hit"] > 0, "不搜索的分页请求应该命中缓存"
+
+
+# ============================================================
+# 题库计数（分页之后前端算不出来，必须由服务端提供）
+# ============================================================
+
+def _stats(client, bank_id, headers):
+    resp = client.get(f"/api/banks/{bank_id}/question-stats", headers=headers)
+    assert resp.status_code == 200, resp.text
+    return resp.json()
+
+
+def test_question_stats_counts_each_category(client, auth_headers, created_bank):
+    bank_id = created_bank["id"]
+    bulk_import(client, bank_id, auth_headers, 6)
+    ids = [q["id"] for q in client.get(
+        f"/api/banks/{bank_id}/questions?page=1&page_size=20", headers=auth_headers
+    ).json()]
+
+    # 一道收藏、一道斩题、一道答错、一道写笔记，彼此不重叠
+    client.post(f"/api/questions/{ids[0]}/favorite", headers=auth_headers)
+    client.post(f"/api/questions/{ids[1]}/cut", headers=auth_headers)
+    client.post(f"/api/questions/{ids[2]}/answer",
+                json={"selected_answer": "D"}, headers=auth_headers)   # 正确是 A，答错
+    client.put(f"/api/questions/{ids[3]}/note",
+               json={"note": "错题笔记"}, headers=auth_headers)
+
+    st = _stats(client, bank_id, auth_headers)
+    assert st["total"] == 6
+    assert st["cut"] == 1, "斩题数不对"
+    assert st["normal"] == 5, "非斩题数不对"
+    assert st["favorite"] == 1
+    assert st["wrong"] == 1
+    assert st["note"] == 1
+
+
+def test_question_stats_excludes_cut_from_wrong_and_favorite(
+    client, auth_headers, created_bank
+):
+    """收藏 + 斩题之后，它不该再算进「我的收藏」——和前端的 computed 口径一致。"""
+    bank_id = created_bank["id"]
+    bulk_import(client, bank_id, auth_headers, 2)
+    target = client.get(
+        f"/api/banks/{bank_id}/questions?page=1&page_size=20", headers=auth_headers
+    ).json()[0]["id"]
+
+    client.post(f"/api/questions/{target}/favorite", headers=auth_headers)
+    assert _stats(client, bank_id, auth_headers)["favorite"] == 1
+
+    client.post(f"/api/questions/{target}/cut", headers=auth_headers)
+    st = _stats(client, bank_id, auth_headers)
+    assert st["favorite"] == 0, "斩题之后不该还算作收藏"
+    assert st["cut"] == 1
+    assert st["normal"] == 1
+
+
+def test_question_stats_by_type_splits_image_questions(
+    client, auth_headers, created_bank
+):
+    """带图的题单独算一类，不再计入原题型（和前端 typeList 一致）。"""
+    bank_id = created_bank["id"]
+    client.post(
+        f"/api/banks/{bank_id}/questions",
+        json={"stem": "看图作答 ![图](/uploads/a.png)", "question_type": "single",
+              "options": ["甲", "乙"], "correct_answer": "A", "explanation": ""},
+        headers=auth_headers,
+    )
+    client.post(
+        f"/api/banks/{bank_id}/questions",
+        json={"stem": "普通单选题", "question_type": "single",
+              "options": ["甲", "乙"], "correct_answer": "A", "explanation": ""},
+        headers=auth_headers,
+    )
+
+    by_type = _stats(client, bank_id, auth_headers)["by_type"]
+    assert by_type["image"] == 1
+    assert by_type["single"] == 1, "带图的题不该再算进单选"
+
+    # 六个题型键必须都在，前端的格子不能因为缺 key 显示成 NaN
+    for key in ("single", "multiple", "judge", "blank", "short", "calc", "image"):
+        assert key in by_type, f"缺 {key}"
+
+
+def test_question_stats_by_type_excludes_cut(client, auth_headers, created_bank):
+    bank_id = created_bank["id"]
+    bulk_import(client, bank_id, auth_headers, 3)
+    target = client.get(
+        f"/api/banks/{bank_id}/questions?page=1&page_size=20", headers=auth_headers
+    ).json()[0]["id"]
+    client.post(f"/api/questions/{target}/cut", headers=auth_headers)
+
+    assert _stats(client, bank_id, auth_headers)["by_type"]["single"] == 2
+
+
+def test_question_stats_is_per_user(client, auth_headers, created_bank):
+    """别人斩了题，不能影响我看到的计数。"""
+    bank_id = created_bank["id"]
+    bulk_import(client, bank_id, auth_headers, 2)
+    assert _stats(client, bank_id, auth_headers)["cut"] == 0
+
+
+def test_question_stats_rejects_other_users_bank(client, auth_headers):
+    """越权访问别人的题库要 404，而不是泄漏计数。"""
+    other = client.post(
+        "/api/banks",
+        json={"name": "别人的题库", "subject": "数学", "description": ""},
+        headers=auth_headers,
+    ).json()
+
+    # 换一个用户
+    client.post("/api/register", json={"username": "intruder", "password": "test123456"})
+    token = client.post(
+        "/api/login", json={"username": "intruder", "password": "test123456"}
+    ).json()["token"]
+    resp = client.get(
+        f"/api/banks/{other['id']}/question-stats",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 404

@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 from fastapi import APIRouter, Depends, HTTPException, Response, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
-from sqlalchemy import func
+from sqlalchemy import case, func, or_
 from sqlalchemy.orm import Session
 
 from app.cache import QLIST_TTL, cache
@@ -193,6 +193,24 @@ def _content_item(question: Question) -> dict:
     }
 
 
+# 题干里带 Markdown 图片的题（`![alt](url)`）。
+#
+# 前端 Bank.vue / Practice.vue 里用正则 /!\[[^\]]*\]\([^)]+\)/ 判断"看图题"，
+# SQL 这边只做得到一个近似：LIKE 的 % 不区分"零个还是多个字符"，
+# 所以 `![]()`（alt 和 url 都为空）在 SQL 会被算成看图题、在 JS 不会。
+# 真实数据里不存在这种题干，这里接受这点差异，换来的是不用把两万条题干读进内存。
+_IMAGE_STEM_LIKE = "%![%](%)%"
+
+
+def _like_pattern(text: str) -> str:
+    r"""把用户输入变成 LIKE 模式，并转义 `%` / `_` 两个通配符。
+
+    不转义的话搜「50%」会变成「50 后面跟任意字符」，搜出一堆无关的题。
+    """
+    escaped = text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{escaped}%"
+
+
 def validate_question(
     question_type: str,
     options: list[str],
@@ -337,6 +355,7 @@ def list_questions(
     response: Response,
     filter_type: str | None = None,
     question_type: str | None = None,
+    q: str | None = None,
     page: int | None = None,
     page_size: int = 50,
     user_id: int = Depends(current_user_id),
@@ -349,6 +368,14 @@ def list_questions(
     - 传 `page`：返回第 `page` 页（`page_size` 默认 50、上限 100），
       响应头带 `X-Total-Count` / `X-Has-More`，前端据此做「加载更多」；
     - 不传 `page`：保持 v1 行为返回全量（老调用方兼容用）。
+
+    ## 关键词搜索
+
+    传 `q` 会在**服务端**按题干或笔记模糊匹配（`%` / `_` 已转义）。
+    分页之后前端手里只有一个页的题，再做客户端过滤就只能搜到当前页，
+    这是错的——所以搜索必须回源。
+
+    搜索请求**不走缓存**：查询词是用户临时的，缓存收益低、key 还容易被刷爆。
 
     v1 是一次性 `order_by(Question.id.desc()).all()`：题库里有两万道题时，
     ORM 要把两万行实例化、再序列化成几 MB JSON 一次性吐出去。
@@ -385,7 +412,11 @@ def list_questions(
     # 一是单个 key 8MB（Redis 单线程，操作大 key 会阻塞别的请求），
     # 二是「构造这个 value」的成本和直接查库差不多，缓存没省下什么。
     # 这类请求是 v1 的遗留调用方式，本身就该被分页取代，所以不回源缓存。
-    use_cache = paginated and not state_filtered
+    #
+    # 有关键词搜索时也不进缓存：查询词是用户临时输入的，几乎不会重复命中，
+    # 缓存只会被各种长尾 q 撑大。
+    keyword = (q or "").strip()
+    use_cache = paginated and not state_filtered and not keyword
 
     if use_cache:
         # ---------- 走缓存：题目内容 + 版本号 ----------
@@ -448,6 +479,17 @@ def list_questions(
         if question_type:
             query = query.filter(Question.question_type == question_type)
 
+        if keyword:
+            # 题干或笔记命中即可。笔记在 QuestionUserState 上，这里已经 outer join 过，
+            # 所以一条 SQL 就能同时搜两处。
+            pattern = _like_pattern(keyword)
+            query = query.filter(
+                or_(
+                    Question.stem.like(pattern, escape="\\"),
+                    QuestionUserState.note.like(pattern, escape="\\"),
+                )
+            )
+
         query = query.order_by(Question.id.desc())
 
         if paginated:
@@ -468,6 +510,93 @@ def list_questions(
         bool(paginated and page * page_size < total)
     ).lower()
     return items
+
+
+@router.get("/banks/{bank_id}/question-stats")
+def question_stats(
+    bank_id: int,
+    user_id: int = Depends(current_user_id),
+    db: Session = Depends(get_db),
+):
+    """题库的各种计数，给分页后的题目列表用。
+
+    分页之后前端手里只有一个页的题目，算不出「我的错题有几道」这类数字，
+    所以计数必须由服务端给。
+
+    刻意**用聚合查询一次算完**，而不是让前端对每个筛选条件各发一个
+    `page_size=1` 的请求去读 `X-Total-Count` 响应头——那样一个页面要发十来个
+    请求，每个都得走一遍鉴权和连接池。
+
+    返回字段和前端 Bank.vue 里的几个 computed 一一对应：
+    `total` / `normal` / `wrong` / `favorite` / `cut` / `note` / `by_type`。
+    """
+    bank_for_user(bank_id, user_id, db)
+
+    # is_cut / wrong_count 可能整行是 NULL（这个用户还没碰过这道题），
+    # 所以统一 coalesce 之后再比较；`is_cut.isnot(True)` 是空安全的
+    # （SQL 里 `NULL IS NOT TRUE` 为真），不能写成 `!= True`，否则
+    # 没碰过的题会被判成"已斩题"。
+    not_cut = QuestionUserState.is_cut.isnot(True)
+
+    def _joined():
+        return (
+            db.query(Question, QuestionUserState)
+            .outerjoin(
+                QuestionUserState,
+                (QuestionUserState.question_id == Question.id)
+                & (QuestionUserState.user_id == user_id),
+            )
+            .filter(Question.bank_id == bank_id, Question.is_archived.is_(False))
+        )
+
+    row = _joined().with_entities(
+        func.count(Question.id),
+        func.sum(case((QuestionUserState.is_cut.is_(True), 1), else_=0)),
+        func.sum(case((not_cut, 1), else_=0)),
+        func.sum(
+            case(
+                (not_cut & (func.coalesce(QuestionUserState.wrong_count, 0) > 0), 1),
+                else_=0,
+            )
+        ),
+        func.sum(
+            case((not_cut & QuestionUserState.is_favorite.is_(True), 1), else_=0)
+        ),
+        func.sum(
+            case((func.coalesce(QuestionUserState.note, "") != "", 1), else_=0)
+        ),
+    ).one()
+    total, cut, normal, wrong, favorite, note = (int(v or 0) for v in row)
+
+    # 分题型计数。有图的题单独算一类、不再计入原题型——口径和前端 typeList
+    # 一致（看图题占一个格子，原题型格子里不重复算它）。
+    type_expr = case(
+        (Question.stem.like(_IMAGE_STEM_LIKE), "image"),
+        else_=Question.question_type,
+    )
+    type_rows = (
+        _joined()
+        .with_entities(type_expr, func.count(Question.id))
+        .filter(not_cut)
+        .group_by(type_expr)
+        .all()
+    )
+
+    by_type = {t: 0 for t in VALID_TYPES}
+    by_type["image"] = 0
+    for name, count in type_rows:
+        by_type[str(name)] = int(count or 0)
+
+    return {
+        "bank_id": bank_id,
+        "total": total,
+        "normal": normal,
+        "cut": cut,
+        "wrong": wrong,
+        "favorite": favorite,
+        "note": note,
+        "by_type": by_type,
+    }
 
 
 @router.post("/banks/{bank_id}/questions", status_code=201)
