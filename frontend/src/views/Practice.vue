@@ -446,7 +446,6 @@ const completedCount = computed(() => questions.value.filter(q => answers.value[
 const correctCount = computed(() => questions.value.filter(q => answers.value[q.id]?.isCorrect).length)
 const wrongCount = computed(() => questions.value.filter(q => answers.value[q.id] && !answers.value[q.id].isCorrect).length)
 const progressPercent = computed(() => questions.value.length ? (completedCount.value / questions.value.length) * 100 : 0)
-const isAllDone = computed(() => completedCount.value === questions.value.length)
 
 const canSubmit = computed(() => {
   const q = currentQuestion.value

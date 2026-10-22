@@ -6,6 +6,7 @@ import Home from '@/views/Home.vue'
 import Practice from '@/views/Practice.vue'
 import Bank from '@/views/Bank.vue'
 import Stats from '@/views/Stats.vue'
+import Knowledge from '@/views/Knowledge.vue'
 
 const router = createRouter({
   history: createWebHistory(),
@@ -18,6 +19,7 @@ const router = createRouter({
     { path: '/banks/:id', component: Bank },
     { path: '/practice', component: Practice },
     { path: '/stats', component: Stats },
+    { path: '/knowledge', component: Knowledge },
   ],
 })
 

@@ -111,13 +111,48 @@ npm run dev                                         # http://localhost:5173
 - 支持**收藏**、**写笔记**、**斩题**（标记为已掌握，不再出现在练习里）、**批量斩题**
 - 按「错题 / 收藏 / 斩题 / 有笔记」筛选
 
-### AI 讲题（本地大模型，数据不出机器）
+### AI 讲题（可本地可云端，默认本地）
 
 - **AI 解析**：针对当前题目生成讲解，SSE 流式输出有打字机效果，支持 LaTeX 公式渲染
 - **AI 助手**：基于 Function Calling 实现了两个工具，参考 ReAct 思路让模型自己决定调不调工具
   - `search_wrong_questions` —— 查你的错题（"我之前错过哪些类似的题？"）
   - `grade_calculation` —— 批改计算 / 简答 / 填空题（"我算的是 96，对吗？"）
 - 解析结果缓存到 Redis，**同一道题再问不会重复调用模型**
+- 模型服务可切换：`LLM_PROVIDER=ollama`（本地跑，数据不出机器）或
+  `bailian`（阿里云百炼，OpenAI 兼容模式，按量计费）。两者共用同一套调用代码，
+  切换不用改业务逻辑
+
+### 讲义知识库（RAG）
+
+页面在 **`/knowledge`**：上传讲义、看切分结果、看检索分数、给题目打知识点。
+
+- **上传解析**：支持 PDF / DOCX / Markdown / TXT
+  - PDF 走**双引擎**：先用 pypdfium2 抽，抽不出可用文本再退回 pdfminer
+  - 抽完过一道**可读性闸门**，用一张高频字表算「高频字占中文字符的比例」：
+    - 高频字占比 < 15%、或 `(cid:)` 编码占比 > 2% → 判定 `garbage`，**直接拦截**
+      并说明「这种 PDF 通常是字体子集缺 ToUnicode 映射，需要 OCR 或换文字版材料」
+    - 高频字占比 15% ~ 30% → 判定 `suspect`，放行但附一条「检索效果可能不好」的警告
+    - 文本不足 30 字 → `too_short`；中文字符不足 20 个（英文材料）→ `no_cjk`，不做中文判定
+  - 扫描件（整页是图片、抽不出文字）会被明确拒绝并提示先做 OCR，
+    而不是静默入库一堆空片段
+- **切分**：按段落聚合成块，带重叠窗口，保留章节 / 页码，切完可在页面逐块查看
+- **检索**：BM25（中文按 2-gram，不依赖分词词典）+ 向量余弦，**加权混合**
+  - 权重 α 可在页面上拖动，`α = 0` 是纯关键词、`α = 1` 是纯语义
+  - 检索结果把 `score` / `bm25_score` / `vector_score` / `coverage` 四项分数
+    都返回并画成条形，能直接看出混合检索是不是真比单路好（调参用）
+  - 有词命中率下限过滤，避免把几乎不相关的片段塞进 prompt
+- **引用出处**：AI 讲解引用的片段会带上「来自哪本讲义、第几页」
+- **知识点自动打标**：大模型读题目归纳知识点，写入关联表；支持
+  `dry_run` 先看提示词再决定跑不跑，默认只处理还没打标的题，不重复烧推理
+
+> **关于向量**：项目没有引入向量数据库。片段量级在万级以内，向量直接以 JSON
+> 存在 MySQL 里、在 Python 侧算余弦就够了；多引一个需要单独部署和运维的组件，
+> 换来的收益在这个数据量下不成立。**代价是全量扫描**，所以它适合万级片段，
+> 不适合百万级——真到那个量级应该换成 pgvector 或 Milvus。
+
+> **关于 embedding**：向量检索需要 embedding 模型。没配（或模型服务连不上）时
+> 入库会**自动退化成只建 BM25 索引**，检索仍然可用，页面会标出「仅 BM25 索引」
+> 和「向量覆盖率 0%」，不会直接报错。
 
 ### 学习统计
 
@@ -141,7 +176,9 @@ npm run dev                                         # http://localhost:5173
 | 鉴权 | **PyJWT · bcrypt** | Bearer Token，`HTTPBearer` 依赖注入 |
 | 校验 | **Pydantic v2** | 请求体校验，统一 422 错误格式 |
 | 导入解析 | **openpyxl · python-docx · pdfplumber** | 分别解析 Excel / Word / PDF |
-| AI | **Ollama** | 本地跑大模型，SSE 流式返回 |
+| RAG 解析 | **pypdfium2 · pdfminer.six** | 讲义 PDF 双引擎解析 + 可读性闸门 |
+| RAG 检索 | **自实现 BM25(2-gram) + 余弦混合** | 不依赖分词词典和向量数据库 |
+| AI | **Ollama / 阿里云百炼** | 同一套接口，`LLM_PROVIDER` 切换；SSE 流式返回 |
 | 前端 | **Vue 3 · TypeScript · Vite** | Composition API，`<script setup>` |
 | 图表 / 公式 | **ECharts · KaTeX** | 学习报告图表、数学公式渲染 |
 | 编排 | **Docker Compose · Nginx** | 四容器，Nginx 反代 + 静态托管 |
@@ -169,17 +206,20 @@ cuoti-notebook/
 │   │   ├── models.py           # SQLAlchemy 模型
 │   │   ├── cache.py            # Redis 缓存层（降级、版本号失效、防击穿）
 │   │   ├── importer.py         # 四种格式的题目解析器
+│   │   ├── knowledge.py        # 知识点：打标提示词、解析、关联表写入
+│   │   ├── llm.py              # 模型服务抽象：Ollama / 百炼 同一套接口
+│   │   ├── rag/                # 讲义解析 / 切分 / 向量化 / 混合检索
 │   │   ├── security.py         # JWT 密钥与算法（集中配置，生产环境缺密钥直接启动失败）
 │   │   ├── agent/              # ReAct 循环 + Function Calling 工具
-│   │   └── routes/             # auth / banks / import_questions / ai / practice ...
+│   │   └── routes/             # auth / banks / import_questions / ai / rag / knowledge ...
 │   ├── tests/                  # pytest 接口测试
-│   ├── scripts/                # 数据集生成 + 压测脚本
+│   ├── scripts/                # 数据集生成 + 压测 + 冒烟脚本
 │   ├── requirements.txt
 │   └── Dockerfile
 │
 └── frontend/
     ├── src/
-    │   ├── views/              # Login / Home / Bank / Practice / Stats ...
+    │   ├── views/              # Login / Home / Bank / Practice / Stats / Knowledge ...
     │   ├── components/         # AiAssistant 等通用组件
     │   ├── api/request.ts      # axios 实例（自动带 token、统一错误处理）
     │   └── router/index.ts     # 路由 + 登录守卫
@@ -210,6 +250,16 @@ Docker 用根目录 `.env`；本地开发用 `backend/.env`（完整列表见 `b
 | `IMPORT_CHUNK_SIZE` | `500` | 导入时每多少条一个事务 |
 | `AI_API_BASE` | `http://localhost:11434` | Ollama 地址 |
 | `AI_MODEL` | `qwen2.5:7b` | 模型名，必须和 `ollama list` 里的一致 |
+| `LLM_PROVIDER` | `ollama` | `ollama` 本地 / `bailian` 阿里云百炼 |
+| `EMBED_MODEL` | `bge-m3` | 本地向量模型，用之前要 `ollama pull bge-m3` |
+| `BAILIAN_API_KEY` | — | 百炼 key。**只写在 `.env` 里，不要提交、不要贴聊天** |
+| `BAILIAN_MODEL` / `BAILIAN_EMBED_MODEL` | `qwen-plus` / `text-embedding-v3` | 百炼的对话 / 向量模型 |
+| `BAILIAN_EMBED_BATCH` | `10` | 百炼向量接口单次条数上限，超了会报错 |
+| `RAG_TOP_K` | `5` | 检索默认召回条数 |
+| `RAG_ALPHA` | `0.5` | 混合检索里向量的权重（`0` 纯 BM25、`1` 纯向量） |
+| `RAG_MIN_COVERAGE` | `0.2` | 词命中率下限，低于它的片段不返回 |
+| `RAG_MAX_DOC_SIZE` | `31457280`（30MB） | 讲义上传大小上限，**要和 Nginx 的 `client_max_body_size` 对齐** |
+| `TAG_BATCH_SIZE` | `10` | 自动打标时一次请求让模型处理几道题 |
 
 ---
 
@@ -271,8 +321,25 @@ pip install -r requirements.txt
 pytest -q
 ```
 
-共 **114 个**接口测试，覆盖认证与账号安全、题库 CRUD、答题判分、越权访问、
-批量导入、分页与缓存一致性。测试用 SQLite 内存库，不会污染你的 MySQL。
+共 **238 个**接口测试，覆盖认证与账号安全、题库 CRUD、答题判分、越权访问、
+批量导入、分页与缓存一致性、RAG 解析与混合检索、知识点打标。
+测试用 SQLite 内存库，不会污染你的 MySQL。
+
+另有一个**需要真实后端在跑**的端到端冒烟脚本，把前端页面用到的知识库接口
+逐个字段打一遍（pytest 是进程内 TestClient，测不出「页面拿到的字段形状对不对」）：
+
+```bash
+# 先把后端跑起来，然后
+cd backend
+python scripts/smoke_knowledge_api.py --base-url http://127.0.0.1:3000
+```
+
+它会注册一个带随机后缀的测试账号、建题库、上传一份 Markdown 讲义，走完
+「列表 → 切分片段 → 检索 → 知识点增删 → 覆盖率 → 打标预览 → 删除级联」，
+并覆盖三类失败路径（不支持的格式 / 空文件 / 解析不出文字的空白文档）。
+默认跑完清理自己上传的文档；加 `--keep` 可以留着打开页面看。
+
+> ⚠️ 它会往 `--base-url` 指向的**当前数据库**写数据，别在线上跑。
 
 ---
 

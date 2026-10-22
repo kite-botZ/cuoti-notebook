@@ -261,7 +261,7 @@
         <template v-if="['single', 'multiple'].includes(newQuestion.question_type)">
           <label>选项</label>
           <div class="option-editor">
-            <div v-for="(opt, i) in newQuestion.options" :key="i" class="option-edit-row">
+            <div v-for="(_, i) in newQuestion.options" :key="i" class="option-edit-row">
               <span class="option-letter">{{ letters[i] }}</span>
               <input v-model.trim="newQuestion.options[i]" :placeholder="`选项 ${letters[i]}`" />
               <button type="button" class="icon-btn" @click="removeOption(i)" :disabled="newQuestion.options.length <= 2">✕</button>
@@ -325,6 +325,30 @@
 
         <label for="q-explanation">解析（可选）</label>
         <textarea id="q-explanation" v-model.trim="newQuestion.explanation" placeholder="解题思路或易错原因"></textarea>
+
+        <!-- 知识点：只对已有题目开放，新建题目保存后再回来添加 -->
+        <template v-if="editingId">
+          <label>知识点</label>
+          <div class="kp-editor">
+            <div v-if="editingKps.length" class="kp-tags">
+              <span v-for="kp in editingKps" :key="kp.name" class="kp-chip">
+                {{ kp.name }}
+                <button type="button" title="移除" @click="removeKp(kp.name)">✕</button>
+              </span>
+            </div>
+            <p v-else class="kp-empty">
+              {{ kpLoading ? '正在读取知识点…' : '还没有知识点，可以手动添加，或在知识库页面用大模型自动打标。' }}
+            </p>
+            <div class="kp-add">
+              <input
+                v-model.trim="kpInput"
+                placeholder="输入知识点名称，例如：对称轴方向"
+                @keydown.enter.prevent="addKp"
+              />
+              <button type="button" class="row-btn" :disabled="!kpInput" @click="addKp">添加</button>
+            </div>
+          </div>
+        </template>
 
         <button class="modal-submit" type="submit" :disabled="saving">
           {{ saving ? '保存中…' : (editingId ? '保存修改' : '保存题目') }}
@@ -514,6 +538,12 @@ const newQuestion = ref({
   options: ['', ''] as string[],
   correct_answer: '',
 })
+
+// 当前编辑题目身上的知识点。大模型打标和手动添加写的是同一张关联表，
+// 这里只保留名字和权重，保存时整体覆盖（后端 PUT 是 replace 语义）。
+const editingKps = ref<{ name: string; weight: number }[]>([])
+const kpInput = ref('')
+const kpLoading = ref(false)
 
 const showImportDialog = ref(false)
 const importFile = ref<File | null>(null)
@@ -753,10 +783,52 @@ async function openEditDialog(q: Question) {
       options: detail.options && detail.options.length ? [...detail.options] : ['', ''],
       correct_answer: detail.correct_answer || '',
     }
+    // 知识点单独取一次：列表接口不带关联（几百道题联表会拖慢列表），
+    // 只在真正打开某道题时查，代价是一次小请求。
+    void loadQuestionKps(q.id)
     showQuestionDialog.value = true
   } catch (e: any) {
     toast.error(e.message || '加载题目失败')
   }
+}
+
+// ==================== 知识点 ====================
+
+type KpLink = { kp_id: number; name: string; subject: string; weight: number; source: string }
+
+async function loadQuestionKps(id: number) {
+  kpLoading.value = true
+  editingKps.value = []
+  kpInput.value = ''
+  try {
+    const list = await request.get(
+      `/questions/${id}/knowledge-points`
+    ) as unknown as KpLink[]
+    editingKps.value = list.map(k => ({ name: k.name, weight: k.weight }))
+  } catch {
+    // 知识点读不到不影响改题，静默即可
+  } finally {
+    kpLoading.value = false
+  }
+}
+
+function addKp() {
+  const name = kpInput.value.trim()
+  if (!name) return
+  if (name.length > 60) {
+    toast.warning('知识点名称最多 60 个字')
+    return
+  }
+  if (editingKps.value.some(k => k.name === name)) {
+    toast.warning('已经加过这个知识点了')
+    return
+  }
+  editingKps.value.push({ name, weight: 1.0 })
+  kpInput.value = ''
+}
+
+function removeKp(name: string) {
+  editingKps.value = editingKps.value.filter(k => k.name !== name)
 }
 
 async function loadQuestionDetail(id: number): Promise<CutQuestion> {
@@ -779,6 +851,8 @@ function closeQuestionDialog() {
   if (saving.value || uploadingStem.value || uploadingAnswer.value) return
   showQuestionDialog.value = false
   editingId.value = null
+  editingKps.value = []
+  kpInput.value = ''
 }
 
 function addOption() {
@@ -868,6 +942,10 @@ async function saveQuestion() {
 
     if (editingId.value) {
       await request.put(`/questions/${editingId.value}`, payload)
+      // 知识点是整体覆盖（后端 replace 语义），所以只要有改动就全量提交
+      await request.put(`/questions/${editingId.value}/knowledge-points`, {
+        knowledge_points: editingKps.value,
+      })
       toast.success('题目已更新')
     } else {
       await request.post(`/banks/${bankId}/questions`, payload)
@@ -1187,6 +1265,17 @@ function downloadJsonTemplate() {
 .question-modal input, .question-modal select, .question-modal textarea { width: 100%; border: 1px solid #d8e4de; border-radius: 8px; padding: 10px; color: #33473d; background: #fff; outline: none; box-sizing: border-box; font-family: inherit; }
 .question-modal textarea { min-height: 72px; resize: vertical; }
 .question-modal .tip { display: block; margin-top: 6px; color: #85928b; font-size: 12px; }
+
+/* 知识点编辑 */
+.kp-editor { border: 1px solid #e4ece7; border-radius: 10px; padding: 12px; background: #fbfdfc; }
+.kp-tags { display: flex; flex-wrap: wrap; gap: 6px; }
+.kp-chip { display: inline-flex; align-items: center; gap: 6px; border-radius: 6px; padding: 5px 8px; color: #28755e; background: #e6f4ed; font-size: 12px; }
+.kp-chip button { border: 0; padding: 0; color: #6da48f; background: transparent; font-size: 11px; line-height: 1; cursor: pointer; }
+.kp-chip button:hover { color: #bf4b3f; }
+.kp-empty { margin: 0; color: #85928b; font-size: 12px; line-height: 1.7; }
+.kp-add { display: flex; gap: 8px; margin-top: 10px; }
+.kp-add input { flex: 1; }
+.kp-add .row-btn { flex: 0 0 auto; }
 .type-picker { display: flex; flex-wrap: wrap; gap: 6px; }
 .type-pick-btn { border: 1px solid #d8e4de; border-radius: 8px; padding: 8px 12px; color: #4a675a; background: #fff; font-size: 13px; cursor: pointer; transition: border-color .18s, background .18s, color .18s; }
 .type-pick-btn:hover { border-color: #8ec5b0; background: #f6fbf8; }

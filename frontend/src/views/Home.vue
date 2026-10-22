@@ -6,6 +6,7 @@
       </router-link>
       <nav>
         <a class="active" href="#banks">我的题库</a>
+        <router-link to="/knowledge">知识库</router-link>
         <router-link to="/stats">学习报告</router-link>
       </nav>
       <div class="user-actions" @click="openProfile">
@@ -324,12 +325,6 @@ async function changePassword() {
 }
 
 function logoutFromProfile() {
-  localStorage.removeItem('token')
-  localStorage.removeItem('username')
-  router.push('/login')
-}
-
-function logout() {
   localStorage.removeItem('token')
   localStorage.removeItem('username')
   router.push('/login')
