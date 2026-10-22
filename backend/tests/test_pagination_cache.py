@@ -508,3 +508,277 @@ def test_question_stats_rejects_other_users_bank(client, auth_headers):
         headers={"Authorization": f"Bearer {token}"},
     )
     assert resp.status_code == 404
+
+
+# ============================================================
+# ids 白名单 / has_image 过滤
+#
+# 这两个参数是为「练习页也要分页」加的：练习页手里经常已经有 id
+# （恢复进度、勾选的题、随机打乱后的顺序），只缺题目正文。
+# 没有这两个参数时它只能拉全量再本地筛，2 万题时就是 8MB / 20 秒。
+# ============================================================
+
+def _add_image_question(client, bank_id, headers, stem):
+    return client.post(
+        f"/api/banks/{bank_id}/questions",
+        json={"stem": stem, "question_type": "single", "options": ["甲", "乙"],
+              "correct_answer": "A", "explanation": ""},
+        headers=headers,
+    ).json()
+
+
+def test_list_by_ids_returns_only_those(client, auth_headers, created_bank):
+    bank_id = created_bank["id"]
+    bulk_import(client, bank_id, auth_headers, 5)
+    all_ids = [
+        q["id"]
+        for q in client.get(
+            f"/api/banks/{bank_id}/questions?page=1&page_size=50", headers=auth_headers
+        ).json()
+    ]
+    want = [all_ids[1], all_ids[3]]
+
+    resp = client.get(
+        f"/api/banks/{bank_id}/questions?page=1&ids={want[0]},{want[1]}",
+        headers=auth_headers,
+    )
+    assert resp.status_code == 200
+    assert sorted(q["id"] for q in resp.json()) == sorted(want)
+    # 计数也要跟着过滤走，否则前端的分页器会以为后面还有几万道
+    assert resp.headers["X-Total-Count"] == "2"
+    assert resp.headers["X-Has-More"] == "false"
+
+
+def test_list_by_ids_is_scoped_to_the_bank(client, auth_headers, created_bank):
+    """拿别人的题目 id 来查，不能跨库读题——过滤之后必须为空，而不是返回那道题。"""
+    bank_id = created_bank["id"]
+    bulk_import(client, bank_id, auth_headers, 2)
+    mine = client.get(
+        f"/api/banks/{bank_id}/questions?page=1", headers=auth_headers
+    ).json()
+
+    other_bank = client.post(
+        "/api/banks", json={"name": "另一个题库", "subject": "数学", "description": ""},
+        headers=auth_headers,
+    ).json()
+    foreign = _add_image_question(client, other_bank["id"], auth_headers, "别人家的题")
+
+    resp = client.get(
+        f"/api/banks/{bank_id}/questions?page=1&ids={foreign['id']}",
+        headers=auth_headers,
+    )
+    assert resp.status_code == 200
+    assert resp.json() == [], "不属于本题库的 id 必须查不到"
+    assert resp.headers["X-Total-Count"] == "0"
+    # 我自己题库里的题当然还在，说明不是把整个列表搞空了
+    assert mine
+
+
+def test_list_by_ids_rejects_bad_input(client, auth_headers, created_bank):
+    """非法 id 明确报 422。
+
+    如果这里静默忽略，前端把参数拼错时会看到"全部题目"，
+    以为筛选生效了——那比报错难查得多。
+    """
+    bank_id = created_bank["id"]
+    bulk_import(client, bank_id, auth_headers, 1)
+
+    resp = client.get(
+        f"/api/banks/{bank_id}/questions?page=1&ids=1,abc", headers=auth_headers
+    )
+    assert resp.status_code == 422
+    assert "abc" in resp.json()["detail"]
+
+
+def test_list_by_ids_rejects_too_many(client, auth_headers, created_bank):
+    """一次最多 100 个 id：不设上限等于允许任意长的 IN 列表，分页就白做了。"""
+    bank_id = created_bank["id"]
+    resp = client.get(
+        f"/api/banks/{bank_id}/questions?page=1&ids=" + ",".join(str(i) for i in range(101)),
+        headers=auth_headers,
+    )
+    assert resp.status_code == 422
+    assert "100" in resp.json()["detail"]
+
+
+def test_list_has_image_filter_matches_stats(client, auth_headers, created_bank):
+    """has_image 的口径必须和 /question-stats 的 by_type.image 一致。
+
+    两边用同一个 `_IMAGE_STEM_LIKE` 判断。如果这里用别的写法（比如只判 `![`），
+    就会出现"统计说 3 道看图题，点进去只列出 2 道"这种对不上的现象。
+    """
+    bank_id = created_bank["id"]
+    _add_image_question(client, bank_id, auth_headers, "看图作答 ![图](/uploads/a.png)")
+    _add_image_question(client, bank_id, auth_headers, "普通题一道")
+    _add_image_question(client, bank_id, auth_headers, "普通题两道")
+
+    stats = _stats(client, bank_id, auth_headers)
+
+    images = client.get(
+        f"/api/banks/{bank_id}/questions?page=1&has_image=true", headers=auth_headers
+    )
+    assert images.status_code == 200
+    assert len(images.json()) == stats["by_type"]["image"] == 1
+    assert "![" in images.json()[0]["stem"]
+
+    text_only = client.get(
+        f"/api/banks/{bank_id}/questions?page=1&has_image=false", headers=auth_headers
+    )
+    assert len(text_only.json()) == 2
+    assert all("![" not in q["stem"] for q in text_only.json())
+
+    # 两类加起来必须等于全部，别把题漏在中间
+    total = client.get(
+        f"/api/banks/{bank_id}/questions?page=1&page_size=50", headers=auth_headers
+    ).headers["X-Total-Count"]
+    assert len(images.json()) + len(text_only.json()) == int(total) == 3
+
+
+def test_list_has_image_can_combine_with_question_type(client, auth_headers, created_bank):
+    """看图题 + 指定题型，两个条件是 AND 关系。"""
+    bank_id = created_bank["id"]
+    _add_image_question(client, bank_id, auth_headers, "看图单选 ![图](/uploads/a.png)")
+    client.post(
+        f"/api/banks/{bank_id}/questions",
+        json={"stem": "看图填空 ![图](/uploads/b.png)", "question_type": "blank",
+              "options": [], "correct_answer": "答案", "explanation": ""},
+        headers=auth_headers,
+    )
+
+    resp = client.get(
+        f"/api/banks/{bank_id}/questions?page=1&has_image=true&question_type=single",
+        headers=auth_headers,
+    )
+    assert len(resp.json()) == 1
+    assert resp.json()[0]["question_type"] == "single"
+
+
+def test_ids_and_image_filters_do_not_poison_the_cache(
+    client, auth_headers, created_bank
+):
+    """带过滤的请求不能把结果写进普通列表的缓存里。
+
+    这是分页 + 缓存最容易出的错：过滤条件不进缓存 key 的话，
+    一次 `has_image=true` 的请求会把"只有 1 道题"的结果缓存到
+    不带过滤的 key 下，之后所有人打开题库都只看到那一道题。
+    """
+    bank_id = created_bank["id"]
+    _add_image_question(client, bank_id, auth_headers, "看图 ![图](/uploads/a.png)")
+    _add_image_question(client, bank_id, auth_headers, "文字题")
+
+    filtered = client.get(
+        f"/api/banks/{bank_id}/questions?page=1&has_image=true", headers=auth_headers
+    )
+    assert len(filtered.json()) == 1
+
+    # 同样参数、去掉过滤：必须还是 2 道
+    plain = client.get(
+        f"/api/banks/{bank_id}/questions?page=1&page_size=50", headers=auth_headers
+    )
+    assert len(plain.json()) == 2, "带过滤的请求污染了普通列表的缓存"
+    assert plain.headers["X-Total-Count"] == "2"
+
+
+# ============================================================
+# 随机练习用的 id 列表接口
+# ============================================================
+
+def test_question_ids_returns_all_and_only_ids(client, auth_headers, created_bank):
+    bank_id = created_bank["id"]
+    bulk_import(client, bank_id, auth_headers, 4)
+
+    resp = client.get(f"/api/banks/{bank_id}/question-ids", headers=auth_headers)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["total"] == 4
+    assert len(body["ids"]) == 4
+    # 只给 id，不给题干——这个接口存在的意义就是"轻"
+    assert isinstance(body["ids"][0], int)
+    assert "stem" not in body
+
+
+def test_question_ids_skips_archived(client, auth_headers, created_bank):
+    """归档的题不该被随机练习抽到。"""
+    bank_id = created_bank["id"]
+    bulk_import(client, bank_id, auth_headers, 3)
+    target = client.get(
+        f"/api/banks/{bank_id}/questions?page=1", headers=auth_headers
+    ).json()[0]["id"]
+    client.delete(f"/api/questions/{target}", headers=auth_headers)
+
+    body = client.get(f"/api/banks/{bank_id}/question-ids", headers=auth_headers).json()
+    assert body["total"] == 2
+    assert target not in body["ids"]
+
+
+def test_question_ids_matches_list_total(client, auth_headers, created_bank):
+    """id 接口的数量和列表接口的 X-Total-Count 必须一致。
+
+    两边对不上的话，随机练习会抽到"列表里其实没有"的题，
+    或者漏掉一批题永远抽不到。
+    """
+    bank_id = created_bank["id"]
+    bulk_import(client, bank_id, auth_headers, 7)
+    listed = client.get(
+        f"/api/banks/{bank_id}/questions?page=1&page_size=100", headers=auth_headers
+    )
+    body = client.get(f"/api/banks/{bank_id}/question-ids", headers=auth_headers).json()
+
+    assert body["total"] == int(listed.headers["X-Total-Count"]) == 7
+    assert set(body["ids"]) == {q["id"] for q in listed.json()}
+
+
+def test_question_ids_rejects_other_users_bank(client, auth_headers):
+    other = client.post(
+        "/api/banks", json={"name": "别人的题库2", "subject": "数学", "description": ""},
+        headers=auth_headers,
+    ).json()
+    client.post("/api/register", json={"username": "intruder2", "password": "test123456"})
+    token = client.post(
+        "/api/login", json={"username": "intruder2", "password": "test123456"}
+    ).json()["token"]
+
+    resp = client.get(
+        f"/api/banks/{other['id']}/question-ids",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 404
+
+
+def test_question_ids_filter_matches_list(client, auth_headers, created_bank):
+    """id 接口的过滤口径必须和列表接口逐一对得上。
+
+    「打乱题序」的流程是"先拿 id 再按 id 取题"：如果 id 接口忽略 filter_type，
+    在错题练习里点打乱就会把整个题库的题都排进来，用户看到一堆没做错的题。
+    """
+    bank_id = created_bank["id"]
+    bulk_import(client, bank_id, auth_headers, 6)
+    listed = client.get(
+        f"/api/banks/{bank_id}/questions?page=1&page_size=50", headers=auth_headers
+    ).json()
+
+    # 制造两种状态：两道错题、一道收藏
+    client.post(f"/api/questions/{listed[0]['id']}/answer",
+                json={"selected_answer": "B"}, headers=auth_headers)
+    client.post(f"/api/questions/{listed[1]['id']}/answer",
+                json={"selected_answer": "B"}, headers=auth_headers)
+    client.post(f"/api/questions/{listed[2]['id']}/favorite", headers=auth_headers)
+
+    for filter_type in ("wrong", "favorite"):
+        list_resp = client.get(
+            f"/api/banks/{bank_id}/questions?page=1&page_size=50&filter_type={filter_type}",
+            headers=auth_headers,
+        ).json()
+        ids_resp = client.get(
+            f"/api/banks/{bank_id}/question-ids?filter_type={filter_type}",
+            headers=auth_headers,
+        ).json()
+
+        assert ids_resp["total"] == len(list_resp), f"{filter_type} 数量对不上"
+        assert set(ids_resp["ids"]) == {q["id"] for q in list_resp}, (
+            f"{filter_type} 的题目集合对不上"
+        )
+
+    # 没有过滤时两边也要一致
+    all_ids = client.get(f"/api/banks/{bank_id}/question-ids", headers=auth_headers).json()
+    assert all_ids["total"] == 6

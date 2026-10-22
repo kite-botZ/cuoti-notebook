@@ -84,7 +84,7 @@
               >
                 {{ currentQuestion.note ? '✎ 笔记' : '＋ 笔记' }}
               </button>
-              <button class="text-button" type="button" @click="shuffleQuestions">打乱题序</button>
+              <button class="text-button" type="button" @click="shuffleAllQuestions">打乱题序</button>
             </div>
           </div>
 
@@ -245,14 +245,17 @@
           >
             ← 上一题
           </button>
-          <span class="nav-progress">{{ currentIndex + 1 }} / {{ questions.length }}</span>
+          <span class="nav-progress">
+            {{ currentIndex + 1 }} / {{ totalCount }}
+            <i v-if="hasMore" class="nav-more">已加载 {{ questions.length }} 题</i>
+          </span>
           <button
             class="nav-btn"
             type="button"
-            :disabled="currentIndex === questions.length - 1"
-            @click="goToQuestion(currentIndex + 1)"
+            :disabled="!canGoNext || loadingMore"
+            @click="nextQuestion"
           >
-            下一题 →
+            {{ loadingMore ? '加载中…' : '下一题 →' }}
           </button>
         </div>
       </template>
@@ -411,7 +414,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import request from '@/api/request'
+import { getPage, default as request } from '@/api/request'
 import { toast } from '@/composables/useToast'
 import AiAssistant from '@/components/AiAssistant.vue'
 import { renderMarkdown, plainStem } from '@/utils/renderMarkdown'
@@ -486,12 +489,38 @@ const qtypeFilter = String(route.query.qtype || '')
 // 也不会把整库拉回浏览器——这正是自适应练习顺带解决的问题。
 const ADAPTIVE_BATCH = 20
 
+// 普通练习每次从服务端取多少题。
+//
+// v1 是进页面就 `GET /banks/{id}/questions` 拉全量：题库里两万道题时
+// 那是 8MB、两秒左右（冷缓存更久），而且浏览器要等整个响应回来才能出第一题。
+// 现在按页取，翻到最后一题时再续下一页。
+const PAGE_SIZE = 50
+
+// 一次按 id 取题的条数上限，和后端 MAX_IDS_FILTER 对齐
+const IDS_CHUNK = 100
+
 const loading = ref(true)
 const submitting = ref(false)
 const mode = ref<'answer' | 'review'>('answer')
 
 const questions = ref<Question[]>([])
 const answers = ref<Record<number, AnswerState>>({})
+
+// 本次练习范围内的题目总数（来自 X-Total-Count），不是"已加载的题数"。
+// 进度条和"共 N 道题"要用它，否则分页之后会显示成"共 50 道题"。
+const totalCount = ref(0)
+const hasMore = ref(false)
+const loadingMore = ref(false)
+
+// 随机练习：整库 id 打乱后的顺序。为 null 表示不是随机模式。
+//
+// 为什么要单独存一份打乱后的 id 列表：分页接口只能按固定顺序一页页给，
+// 在客户端把已加载的那几页打乱不等于"整库随机"。所以先取轻量的 id 列表
+// （两万条 id 约 120KB，不含题目正文）打乱，再按 id 分批取题目。
+let shuffledIds: number[] | null = null
+
+// 已经取到第几页（随机模式下是"第几批"）。续拉下一页靠它，见 loadMoreQuestions。
+let loadedPage = 0
 
 const currentIndex = ref(0)
 const selected = ref<number | number[] | string | null>(null)
@@ -532,7 +561,10 @@ const isSubmitted = computed(() => currentAnswer.value !== null)
 const completedCount = computed(() => questions.value.filter(q => answers.value[q.id] !== undefined).length)
 const correctCount = computed(() => questions.value.filter(q => answers.value[q.id]?.isCorrect).length)
 const wrongCount = computed(() => questions.value.filter(q => answers.value[q.id] && !answers.value[q.id].isCorrect).length)
-const progressPercent = computed(() => questions.value.length ? (completedCount.value / questions.value.length) * 100 : 0)
+// 进度按"本次范围内的总题数"算，不是"已加载的题数"——分页之后后者只是 50，
+// 会让进度条一开始就显示 100%
+const progressPercent = computed(() => totalCount.value ? (completedCount.value / totalCount.value) * 100 : 0)
+const canGoNext = computed(() => currentIndex.value < questions.value.length - 1 || hasMore.value)
 
 const canSubmit = computed(() => {
   const q = currentQuestion.value
@@ -591,16 +623,117 @@ function isCorrectOption(q: CutQuestion, index: number) {
 
 // ==================== 加载 ====================
 
+/**
+ * 当前练习范围对应到列表接口的参数。
+ *
+ * 这些过滤**必须在服务端做**：分页之后浏览器手里只有一个页的题，
+ * 在本地 filter 只能筛出"当前页里符合条件的那些"，看起来像没生效。
+ */
+function scopeParams(): Record<string, string | number | boolean> {
+  if (source === 'type' && qtypeFilter) {
+    // 有图的题归入「看图题」，不再出现在原题型里——口径和题库页的分型统计一致
+    return { question_type: qtypeFilter, has_image: false }
+  }
+  if (source === 'image') return { has_image: true }
+  if (['wrong', 'favorite', 'cut', 'note'].includes(source)) {
+    return { filter_type: source }
+  }
+  return {}
+}
+
+/** 按 id 取题目正文，自动按 100 一批切分，并还原成传入的顺序。 */
+async function fetchByIds(ids: number[]): Promise<Question[]> {
+  const found = new Map<number, Question>()
+  for (let i = 0; i < ids.length; i += IDS_CHUNK) {
+    const chunk = ids.slice(i, i + IDS_CHUNK)
+    const res = (await request.get(
+      `/banks/${bankId}/questions?page=1&page_size=${chunk.length}&ids=${chunk.join(',')}`
+    )) as unknown as Question[]
+    for (const q of res) found.set(q.id, q)
+  }
+  // 后端固定按 id 倒序返回，而"勾选的题"和"恢复进度"都要求保持原顺序
+  return ids.map(id => found.get(id)).filter((q): q is Question => Boolean(q))
+}
+
+/** 取第 page 页（或随机顺序里的第 page 批），replace=false 表示追加。 */
+async function loadPage(page: number, replace: boolean) {
+  let items: Question[] = []
+  let total = 0
+  let more = false
+
+  if (shuffledIds) {
+    const chunk = shuffledIds.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE)
+    if (!chunk.length) {
+      hasMore.value = false
+      return
+    }
+    items = await fetchByIds(chunk)
+    total = shuffledIds.length
+    more = page * PAGE_SIZE < shuffledIds.length
+  } else {
+    const { items: pageItems, total: pageTotal, hasMore: pageMore } = await getPage<Question[]>(
+      `/banks/${bankId}/questions`,
+      { page, page_size: PAGE_SIZE, ...scopeParams() }
+    )
+    items = pageItems
+    total = pageTotal
+    more = pageMore
+  }
+
+  questions.value = replace ? items : [...questions.value, ...items]
+  totalCount.value = total
+  hasMore.value = more
+  loadedPage = page
+}
+
+/** 续拉下一页，追加到当前题单后面。 */
+async function loadMoreQuestions() {
+  if (!hasMore.value || loadingMore.value) return
+  loadingMore.value = true
+  try {
+    // 用"已经取到第几页"这个计数器推算下一页，而不是拿已加载题数去除以 page_size：
+    // 斩掉一道题以后 questions.length 就不是 page_size 的整数倍了，
+    // 用长度推算会重新请求第 1 页，把前面的题又追加一遍。
+    await loadPage(loadedPage + 1, false)
+    scheduleSave()
+  } catch (e: any) {
+    toast.error(e.message || '加载更多题目失败')
+  } finally {
+    loadingMore.value = false
+  }
+}
+
+/**
+ * 「下一题」：到已加载的最后一题时，先续拉下一页再往前走。
+ *
+ * 不用单独的「加载更多」按钮，是因为练习是线性推进的——按钮会打断答题节奏，
+ * 而且用户真正想要的只是"还能继续做"。
+ */
+async function nextQuestion() {
+  if (currentIndex.value < questions.value.length - 1) {
+    goToQuestion(currentIndex.value + 1)
+    return
+  }
+  if (hasMore.value) {
+    await loadMoreQuestions()
+    if (currentIndex.value < questions.value.length - 1) {
+      goToQuestion(currentIndex.value + 1)
+    }
+  }
+}
+
 async function loadQuestions() {
   loading.value = true
   try {
     // 自适应出题单独走一条路：题单由服务端按薄弱知识点挑，而且只是有限的一批。
-    // 不走列表接口，所以下面那套"拉全量再本地过滤"的逻辑都跟它无关。
+    // 不走列表接口，所以下面那套分页逻辑都跟它无关。
     if (source === 'adaptive') {
       await loadAdaptive()
       loading.value = false
       return
     }
+
+    shuffledIds = null
 
     // 先查后端保存的进度
     let savedProgress: any = null
@@ -611,30 +744,34 @@ async function loadQuestions() {
       savedProgress = res.progress
     } catch { /* 忽略 */ }
 
-    let url = `/banks/${bankId}/questions`
-    if (source === 'type' && qtypeFilter) {
-      url += `?question_type=${qtypeFilter}`
-    } else if (['wrong', 'favorite', 'cut'].includes(source)) {
-      url += `?filter_type=${source}`
-    }
-    let list = await request.get(url) as unknown as Question[]
-
-    if (source === 'image') {
-      list = list.filter(q => hasImage(q.stem))
-    }
-    if (source === 'type') {
-      list = list.filter(q => !hasImage(q.stem))
-    }
-
     // ============ 有进度：恢复 ============
+    //
+    // 恢复分两种：
+    // - 勾选 / 随机：题单本身就是一份固定的 id 名单，按 id 精确取回；
+    // - 其余（顺序、错题、收藏、斩题、按题型、看图）：题单是"某题库的某个顺序"，
+    //   所以按同样的页数把前 N 页重新取一遍（每页 8ms 左右），
+    //   这样**恢复之后还能继续往下刷**，而不是被锁死在恢复的那 50 道题里。
     if (savedProgress && savedProgress.question_ids && savedProgress.question_ids.length) {
-      const map = new Map(list.map(q => [q.id, q]))
-      const restored = savedProgress.question_ids
-        .map((id: number) => map.get(id))
-        .filter((q: Question | undefined): q is Question => Boolean(q))
+      const savedIds: number[] = savedProgress.question_ids
+      let restored: Question[] = []
 
-      if (restored.length === savedProgress.question_ids.length) {
+      if (source === 'selected' || source === 'random') {
+        restored = await fetchByIds(savedIds)
         questions.value = restored
+        totalCount.value = restored.length
+        hasMore.value = false
+      } else {
+        const pages = Math.max(1, Math.ceil(savedIds.length / PAGE_SIZE))
+        for (let p = 1; p <= pages; p++) {
+          await loadPage(p, p === 1)
+        }
+        restored = questions.value
+      }
+
+      // 保存的题必须都还在（可能被删/归档）。少一道就当作没有进度，
+      // 否则用户会以为"我上次做到的题丢了"，不如干净地重新开始。
+      const got = new Set(restored.map(q => q.id))
+      if (savedIds.every(id => got.has(id))) {
         answers.value = savedProgress.answers || {}
         currentIndex.value = Math.min(savedProgress.current_index || 0, restored.length - 1)
 
@@ -660,16 +797,38 @@ async function loadQuestions() {
       ids = []
     }
 
-    questions.value = source === 'selected' && ids.length
-      ? list.filter(q => ids.includes(q.id))
-      : list
+    // 「我勾选的题」名单本来就是有限的，一次取完，不做分页
+    if (source === 'selected' && ids.length) {
+      questions.value = await fetchByIds(ids)
+      totalCount.value = questions.value.length
+      hasMore.value = false
+    } else if (source === 'random') {
+      // 随机练习：先取整库 id（轻量）打乱，再分批取题目正文
+      const res = await request.get(
+        `/banks/${bankId}/question-ids`
+      ) as unknown as { ids: number[] }
+      shuffledIds = [...(res.ids || [])]
+      for (let i = shuffledIds.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1))
+        ;[shuffledIds[i], shuffledIds[j]] = [shuffledIds[j], shuffledIds[i]]
+      }
+      await loadPage(1, true)
+    } else {
+      await loadPage(1, true)
+    }
 
-    if (source === 'random') shuffleQuestions()
+    // 「勾选的题」是按 id 一次取完的，没有"页"的概念，计数器归零
+    // （随机模式不能归零：它是分批取的，续拉要靠 loadedPage 推进）
+    if (source === 'selected') loadedPage = 0
 
     currentIndex.value = 0
     selected.value = null
     textInput.value = ''
     showCompletion.value = false
+
+    if (!questions.value.length) {
+      toast.error('这个题库暂时出不了题')
+    }
   } catch (e: any) {
     toast.error(e.message || '题目加载失败')
   } finally {
@@ -699,6 +858,9 @@ async function loadAdaptive() {
       returned: res.returned,
     }
     questions.value = res.picked || []
+    // 自适应这一批就是全部范围，没有"下一页"
+    totalCount.value = questions.value.length
+    hasMore.value = false
     answers.value = {}
     currentIndex.value = 0
     selected.value = null
@@ -777,6 +939,41 @@ function shuffleQuestions() {
   textInput.value = ''
   showCompletion.value = false
   scheduleSave()
+}
+
+/**
+ * 「打乱题序」：把整个练习范围打乱，而不只是已经加载的那几页。
+ *
+ * 分页之后本地 shuffle 只能打乱手里这 50 道题，用户以为"整库都乱了"、
+ * 实际上后 19950 道还是原顺序。所以这里改成重置成随机顺序重新取第一批，
+ * 之后续拉的一页一页也都是从这个打乱顺序里取的。
+ */
+async function shuffleAllQuestions() {
+  if (source === 'adaptive' || source === 'selected') {
+    shuffleQuestions()
+    return
+  }
+  loading.value = true
+  try {
+    const res = await request.get(`/banks/${bankId}/question-ids`, {
+      params: scopeParams(),
+    }) as unknown as { ids: number[] }
+    shuffledIds = [...(res.ids || [])]
+    for (let i = shuffledIds.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1))
+      ;[shuffledIds[i], shuffledIds[j]] = [shuffledIds[j], shuffledIds[i]]
+    }
+    await loadPage(1, true)
+    currentIndex.value = 0
+    selected.value = null
+    textInput.value = ''
+    showCompletion.value = false
+    scheduleSave()
+  } catch (e: any) {
+    toast.error(e.message || '打乱题序失败')
+  } finally {
+    loading.value = false
+  }
 }
 
 // ==================== 作答 ====================
@@ -956,6 +1153,8 @@ async function cutCurrentQuestion() {
   try {
     await request.post(`/questions/${q.id}/cut`)
     questions.value.splice(currentIndex.value, 1)
+    // 斩掉的题不再属于本次范围，总数也要跟着减，否则进度条永远差一道
+    totalCount.value = Math.max(0, totalCount.value - 1)
     if (questions.value.length === 0) {
       showCompletion.value = true
       return

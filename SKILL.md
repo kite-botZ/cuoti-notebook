@@ -39,7 +39,7 @@ AI 讲解，并基于 BKT 掌握度做自适应选题。
           rag.py                  检索调试接口
           mastery.py              掌握度总览 / 自适应选题 / 重置
           daily.py, user.py       每日一练、用户设置
-      tests/                      13 个 test_*.py，325 条用例
+      tests/                      13 个 test_*.py，340 条用例
       scripts/                    造数据、压测、冒烟、连通性自检
       run.py                      启动脚本（uvicorn）
       requirements.txt
@@ -56,7 +56,7 @@ AI 讲解，并基于 BKT 掌握度做自适应选题。
           Login.vue / Register.vue / Forgot.vue
           Home.vue                题库列表
           Bank.vue                题库详情（分页、打标、掌握度面板）
-          Practice.vue            答题页（普通 / 错题 / 收藏 / 自适应）
+          Practice.vue            答题页（普通 / 错题 / 收藏 / 自适应；分页续拉）
           Stats.vue               学习统计
           Knowledge.vue           讲义知识库（上传、切分、检索调参、打标）
 
@@ -98,6 +98,12 @@ bcrypt、MySQL 8、Redis（5.x 起可用，显式走 RESP2）
 - **列表接口一律分页**：`page` / `page_size` 参数，响应头带 `X-Total-Count` / `X-Has-More`。
   不要新增"一次返回整库"的列表接口——2 万题时整包是 8MB / 20 秒，
   前端只能拿到一个卡死的页面
+- **分页之后，客户端手里的数据只有一页**：搜索、按状态/题型过滤、打乱顺序
+  都必须由服务端做（`q` / `filter_type` / `question_type` / `has_image` / `ids`），
+  否则只会筛出"当前页里符合条件的那些"，看起来像生效了其实没有。
+  要在整个范围内随机，用 `/banks/{id}/question-ids` 取 id 后再分批取正文
+- `/question-ids` 的过滤口径必须和 `/banks/{id}/questions` 完全一致
+  （两边用同一套谓词），否则"打乱题序"会把不该出现的题排进来
 - 所有依赖用户身份的接口都要先校验资源归属，防止越权
 
 ## 编码约定
@@ -171,3 +177,4 @@ bcrypt、MySQL 8、Redis（5.x 起可用，显式走 RESP2）
 - 不要写 `from db import`（少了 app. 前缀）
 - 不要给 `.vue`、`.ts` 文件顶上加 `// @ts-nocheck` 掩盖类型错误
 - 不要把整库列表返回给前端（见 API 约定里的分页要求）
+- 不要在分页之后还在客户端做搜索 / 过滤 / 洗牌（作用范围只有当前页）

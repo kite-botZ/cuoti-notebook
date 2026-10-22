@@ -203,6 +203,37 @@ def _content_item(question: Question) -> dict:
 _IMAGE_STEM_LIKE = "%![%](%)%"
 
 
+# 一次最多能按 id 白名单取多少题。
+#
+# 这个上限是给"恢复练习进度"和"随机练习"用的：前端把一批 id 丢过来换题目正文。
+# 设上限是因为 ids 会被拼进 SQL 的 IN (...)，不设上限等于允许任意长的 IN 列表，
+# 也让分页失去意义。100 和 page_size 的上限对齐。
+MAX_IDS_FILTER = 100
+
+
+def _parse_ids(raw: str | None) -> list[int]:
+    """把 `ids=1,2,3` 解析成整数列表。
+
+    非法输入直接 422，而不是静默忽略：如果前端传的 id 格式不对，
+    "安静地返回全部题目"会让用户以为筛选生效了，排查起来很痛苦。
+    """
+    if not raw:
+        return []
+    parts = [p.strip() for p in raw.split(",") if p.strip()]
+    if len(parts) > MAX_IDS_FILTER:
+        raise HTTPException(
+            status_code=422,
+            detail=f"一次最多按 id 取 {MAX_IDS_FILTER} 道题，当前 {len(parts)} 道",
+        )
+    ids: list[int] = []
+    for p in parts:
+        try:
+            ids.append(int(p))
+        except ValueError:
+            raise HTTPException(status_code=422, detail=f"ids 里出现了非法的 id：{p}")
+    return ids
+
+
 def _like_pattern(text: str) -> str:
     r"""把用户输入变成 LIKE 模式，并转义 `%` / `_` 两个通配符。
 
@@ -357,6 +388,8 @@ def list_questions(
     filter_type: str | None = None,
     question_type: str | None = None,
     q: str | None = None,
+    ids: str | None = None,
+    has_image: bool | None = None,
     page: int | None = None,
     page_size: int = 50,
     user_id: int = Depends(current_user_id),
@@ -381,6 +414,18 @@ def list_questions(
     v1 是一次性 `order_by(Question.id.desc()).all()`：题库里有两万道题时，
     ORM 要把两万行实例化、再序列化成几 MB JSON 一次性吐出去。
 
+    ## 按 id 白名单 / 看图题过滤
+
+    - `ids=1,2,3`（最多 100 个）：只取这几道题。练习页恢复进度、
+      "我勾选的题"、随机练习的分批取题都靠它——这些都是"手里已有 id，
+      只缺题目正文"的场景，不需要把整库拉下来再本地筛。
+    - `has_image=true|false`：只看 / 排除题干带 Markdown 图片的题。
+      判定口径和 `/question-stats` 里的 `by_type.image` 完全一致
+      （同一个 `_IMAGE_STEM_LIKE`），否则列表和计数会对不上。
+
+    这两种过滤都**不走缓存**：id 列表是随机的长尾组合，进缓存只会被撑爆；
+    和 `filter_type` 一样，宁可直接查库。
+
     ## 缓存一致性
 
     只缓存「题目内容」，key 里带题库版本号：
@@ -403,10 +448,13 @@ def list_questions(
     if paginated and page < 1:
         raise HTTPException(status_code=422, detail="page 必须 >= 1")
 
+    id_list = _parse_ids(ids)
+
     include_answer = (filter_type == "cut")
     state_filtered = filter_type in ("wrong", "favorite", "cut", "note")
 
-    # 只有「分页 + 不按用户状态过滤」这一种请求才进缓存。
+    # 只有「分页 + 不按用户状态过滤 + 无关键词 + 无 id 白名单 + 无图片过滤」
+    # 这一种请求才进缓存。
     #
     # 为什么不缓存全量请求：不传 page 时一个题库两万道题，
     # 序列化出来是 8MB 的 JSON。把它塞进 Redis 有两个坏处——
@@ -417,7 +465,13 @@ def list_questions(
     # 有关键词搜索时也不进缓存：查询词是用户临时输入的，几乎不会重复命中，
     # 缓存只会被各种长尾 q 撑大。
     keyword = (q or "").strip()
-    use_cache = paginated and not state_filtered and not keyword
+    use_cache = (
+        paginated
+        and not state_filtered
+        and not keyword
+        and not id_list
+        and has_image is None
+    )
 
     if use_cache:
         # ---------- 走缓存：题目内容 + 版本号 ----------
@@ -479,6 +533,18 @@ def list_questions(
 
         if question_type:
             query = query.filter(Question.question_type == question_type)
+
+        # 按 id 白名单取题。仍然要带上 bank_id 和 user_id 的归属校验
+        # （上面的 bank_for_user 已经挡了别人的题库，这里再挡一次"不属于本题库的 id"，
+        # 否则传别家题库的 id 就能跨库读题）。
+        if id_list:
+            query = query.filter(Question.id.in_(id_list))
+
+        if has_image is not None:
+            if has_image:
+                query = query.filter(Question.stem.like(_IMAGE_STEM_LIKE))
+            else:
+                query = query.filter(~Question.stem.like(_IMAGE_STEM_LIKE))
 
         if keyword:
             # 题干或笔记命中即可。笔记在 QuestionUserState 上，这里已经 outer join 过，
@@ -598,6 +664,74 @@ def question_stats(
         "note": note,
         "by_type": by_type,
     }
+
+
+@router.get("/banks/{bank_id}/question-ids")
+def question_ids(
+    bank_id: int,
+    filter_type: str | None = None,
+    question_type: str | None = None,
+    has_image: bool | None = None,
+    user_id: int = Depends(current_user_id),
+    db: Session = Depends(get_db),
+):
+    """题库里符合条件的题目 id，给「随机练习 / 打乱题序」用。
+
+    ## 为什么不直接返回题目
+
+    "随机练习"要的是**整库打乱**，而分页接口只能按固定顺序一页页给，
+    在客户端打乱已经加载的那一页并不是真的随机。所以拆成两步：
+
+    1. 先取 id（这里），数量级是每个 id 几个字节；
+    2. 打乱 id 顺序，再按 `ids=` 分批取题目正文（一次最多 100 道）。
+
+    两万道题时，第 1 步约 120KB、第 2 步每批约 15KB；
+    而 v1 的做法是一次拉 8MB 的题目正文再在浏览器里 shuffle。
+
+    ## 过滤口径必须和列表接口一致
+
+    `filter_type` / `question_type` / `has_image` 的语义和
+    `GET /banks/{bank_id}/questions` 完全相同（`filter_type` 支持
+    wrong / favorite / cut / note）。如果不一致，会出现"打乱之后冒出没做错的题"
+    这种问题——所以 `test_pagination_cache.py` 里有一条用例专门比对两边。
+
+    ## 只有 id，没有题目内容
+
+    这里**只查 id 列**（`db.query(Question.id)`），不构造 ORM 实例，
+    也不走题目列表缓存——理由和列表接口一样，两万行的序列化成本全在正文上。
+    """
+    bank_for_user(bank_id, user_id, db)
+
+    query = (
+        db.query(Question.id)
+        .outerjoin(
+            QuestionUserState,
+            (QuestionUserState.question_id == Question.id)
+            & (QuestionUserState.user_id == user_id),
+        )
+        .filter(Question.bank_id == bank_id, Question.is_archived.is_(False))
+    )
+
+    if filter_type == "wrong":
+        query = query.filter(QuestionUserState.wrong_count > 0)
+    elif filter_type == "favorite":
+        query = query.filter(QuestionUserState.is_favorite.is_(True))
+    elif filter_type == "cut":
+        query = query.filter(QuestionUserState.is_cut.is_(True))
+    elif filter_type == "note":
+        query = query.filter(QuestionUserState.note != "")
+
+    if question_type:
+        query = query.filter(Question.question_type == question_type)
+    if has_image is not None:
+        if has_image:
+            query = query.filter(Question.stem.like(_IMAGE_STEM_LIKE))
+        else:
+            query = query.filter(~Question.stem.like(_IMAGE_STEM_LIKE))
+
+    rows = query.order_by(Question.id.desc()).all()
+    ids = [int(r[0]) for r in rows]
+    return {"bank_id": bank_id, "total": len(ids), "ids": ids}
 
 
 @router.post("/banks/{bank_id}/questions", status_code=201)
