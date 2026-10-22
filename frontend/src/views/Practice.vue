@@ -499,6 +499,10 @@ const PAGE_SIZE = 50
 // 一次按 id 取题的条数上限，和后端 MAX_IDS_FILTER 对齐
 const IDS_CHUNK = 100
 
+// 恢复进度时最多重取几页。见 loadQuestions 里的说明：
+// 老版本存下来的 question_ids 可能有两万个，照单全取会让"恢复"变成最慢的操作。
+const MAX_RESTORE_PAGES = 6
+
 const loading = ref(true)
 const submitting = ref(false)
 const mode = ref<'answer' | 'review'>('answer')
@@ -761,17 +765,25 @@ async function loadQuestions() {
         totalCount.value = restored.length
         hasMore.value = false
       } else {
-        const pages = Math.max(1, Math.ceil(savedIds.length / PAGE_SIZE))
+        // 最多重取 6 页（300 道）。为什么要有上限：老版本是"进页面就拉全库"，
+        // 那时存下来的 question_ids 可能是两万个——照单全取就是几百次请求，
+        // 恢复进度反而成了最慢的操作。取前几页 + hasMore 让它按需续拉就够了。
+        const pages = Math.min(
+          MAX_RESTORE_PAGES,
+          Math.max(1, Math.ceil(savedIds.length / PAGE_SIZE)),
+        )
         for (let p = 1; p <= pages; p++) {
           await loadPage(p, p === 1)
         }
         restored = questions.value
       }
 
-      // 保存的题必须都还在（可能被删/归档）。少一道就当作没有进度，
+      // 恢复出来的题里必须包含保存的那些（可能被删/归档）。少一道就当作没有进度，
       // 否则用户会以为"我上次做到的题丢了"，不如干净地重新开始。
+      // 注意只比对"恢复范围内"的那一段：上面可能因为页数上限只取回了前几页。
       const got = new Set(restored.map(q => q.id))
-      if (savedIds.every(id => got.has(id))) {
+      const prefix = savedIds.slice(0, Math.min(savedIds.length, restored.length))
+      if (prefix.every(id => got.has(id))) {
         answers.value = savedProgress.answers || {}
         currentIndex.value = Math.min(savedProgress.current_index || 0, restored.length - 1)
 
