@@ -451,9 +451,15 @@ python scripts/bench_api.py --base-url http://127.0.0.1:3000 --bank-id 1
 # 分页 / 服务端搜索 / 计数：这个脚本打的是 3002（bench 库），
 # 地址用环境变量 BASE 覆盖
 BASE=http://127.0.0.1:3002 python scripts/bench_questions_api.py
+
+# 练习页进入开销（上面那张表就是它跑出来的）
+BASE=http://127.0.0.1:3002 python scripts/bench_practice_load.py
+# 练习页会发的请求逐个核对（分页头、过滤口径、422 边界）
+BASE=http://127.0.0.1:3002 python scripts/check_practice_api.py
 ```
 
-`bench_questions_api.py` 顶部注释里记着本机实测数字，改完代码可以直接对照重跑。
+`bench_questions_api.py` / `bench_practice_load.py` 顶部注释里记着本机实测数字，
+改完代码可以直接对照重跑；结果还会写进 `bench-results/*.json`。
 
 ---
 
