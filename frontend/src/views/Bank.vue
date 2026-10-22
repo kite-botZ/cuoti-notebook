@@ -123,6 +123,98 @@
         </div>
       </section>
 
+      <!-- 认知诊断：知识点掌握度 -->
+      <section id="mastery" class="feature-section mastery-section">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">COGNITIVE DIAGNOSIS</p>
+            <h2>知识点掌握度</h2>
+            <p class="section-note">
+              用 BKT 从每次作答在线更新，不是正确率。没做过的知识点按初始值显示。
+            </p>
+          </div>
+          <div class="mastery-summary" v-if="mastery && mastery.kp_count">
+            <div class="mastery-overall">
+              <span class="mastery-overall-num">{{ percent(mastery.overall_p_known) }}%</span>
+              <small>平均掌握度 · {{ mastery.overall_level }}</small>
+            </div>
+            <button type="button" class="outline-button" :disabled="resetting" @click="resetMastery">
+              {{ resetting ? '重置中…' : '重置诊断' }}
+            </button>
+          </div>
+        </div>
+
+        <div v-if="masteryLoading" class="mastery-hint">正在读取诊断结果…</div>
+
+        <div v-else-if="!mastery || mastery.kp_count === 0" class="mastery-hint">
+          <strong>这个题库还没有知识点标注</strong>
+          <p>
+            认知诊断的对象是知识点，所以要先给题目打标签。
+            可以到
+            <router-link to="/knowledge">知识库</router-link>
+            页跑一次「自动标注」（用大模型批量标注考点），或在题目编辑里手动指定。
+          </p>
+        </div>
+
+        <template v-else>
+          <div class="mastery-actions">
+            <button
+              type="button"
+              class="adaptive-btn"
+              :disabled="adaptiveStarting || stats.normal === 0"
+              @click="startAdaptive"
+            >
+              <span class="play-icon">▶</span>
+              <span>
+                <strong>{{ adaptiveStarting ? '正在选题…' : '自适应刷题' }}</strong>
+                <small>
+                  按最薄弱的知识点出题，每题都会说明为什么选它
+                </small>
+              </span>
+              <i>→</i>
+            </button>
+            <p class="mastery-actions-note">
+              已练 {{ mastery.practiced_count }} / {{ mastery.kp_count }} 个知识点，
+              还有 {{ mastery.untouched_count }} 个没练过。
+            </p>
+          </div>
+
+          <ul class="mastery-list">
+            <li
+              v-for="kp in mastery.items"
+              :key="kp.kp_id"
+              class="mastery-row"
+              :class="`lv-${levelKey(kp.level)}`"
+            >
+              <div class="mastery-row-head">
+                <strong>{{ kp.name }}</strong>
+                <span class="mastery-level">{{ kp.level }}</span>
+              </div>
+              <div class="mastery-bar">
+                <span class="mastery-bar-fill" :style="{ width: percent(kp.p_known) + '%' }"></span>
+              </div>
+              <div class="mastery-row-meta">
+                <span class="mastery-p">{{ kp.p_known.toFixed(2) }}</span>
+                <span v-if="kp.practiced">
+                  做过 {{ kp.attempts }} 次 ·
+                  正确率 {{ kp.accuracy === null ? '—' : percent(kp.accuracy) + '%' }}
+                  <template v-if="kp.accuracy !== null && kp.accuracy - kp.p_known > 0.25">
+                    · 正确率明显高于掌握度，可能是蒙对的
+                  </template>
+                </span>
+                <span v-else>还没做过 · 题库里这类题 {{ kp.question_count }} 道</span>
+              </div>
+            </li>
+          </ul>
+          <p class="mastery-foot">
+            掌握度是「已掌握的概率」，恒在 0.01~0.99 之间。它和正确率不一致时
+            恰恰是最该看的信号。参数：初始 {{ mastery.params.p_init }} ·
+            学习率 {{ mastery.params.p_learn }} · 失误率 {{ mastery.params.p_slip }} ·
+            猜测率 {{ mastery.params.p_guess }}。
+          </p>
+        </template>
+      </section>
+
       <!-- 题目列表 -->
       <section id="questions" class="question-manager">
         <div class="manager-heading">
@@ -575,6 +667,44 @@ const stats = ref({
   by_type: {} as Record<string, number>,
 })
 
+// ==================== 认知诊断 ====================
+//
+// 掌握度由服务端算（BKT，每次作答在线更新），前端只负责展示。
+// 不在前端算的理由：掌握度是增量状态，得按作答的**时间顺序**逐次推进，
+// 前端手里只有当前这一页的题目，连历史作答顺序都拿不到。
+type MasteryItem = {
+  kp_id: number
+  name: string
+  parent_id: number | null
+  subject: string
+  question_count: number
+  p_known: number
+  level: string
+  need: number
+  attempts: number
+  correct: number
+  accuracy: number | null
+  practiced: boolean
+  last_answered_at: number | null
+}
+
+type MasteryReport = {
+  bank_id: number
+  kp_count: number
+  practiced_count: number
+  untouched_count: number
+  overall_p_known: number | null
+  overall_level: string | null
+  weakest: MasteryItem | null
+  params: { p_init: number; p_learn: number; p_slip: number; p_guess: number }
+  items: MasteryItem[]
+}
+
+const mastery = ref<MasteryReport | null>(null)
+const masteryLoading = ref(false)
+const resetting = ref(false)
+const adaptiveStarting = ref(false)
+
 const query = ref('')
 const selectedIds = ref<number[]>([])
 const showNotes = ref(false)
@@ -692,6 +822,17 @@ function formatSize(bytes: number) {
   return `${(bytes / 1024 / 1024).toFixed(2)} MB`
 }
 
+// 掌握度 0~1 → 百分比整数
+function percent(p: number | null) {
+  if (p === null || p === undefined) return 0
+  return Math.round(p * 100)
+}
+
+// 档位 → 样式类名。档位里有中文，不能直接当 class 用
+function levelKey(level: string) {
+  return { 熟练: 'mastered', 基本掌握: 'ok', 薄弱: 'weak' }[level] || 'none'
+}
+
 // ==================== 加载 ====================
 
 async function loadBank() {
@@ -712,6 +853,56 @@ async function loadStats() {
   } catch (e: any) {
     // 计数失败不该让整页打不开，列表还是能看的
     toast.error(e.message || '题目统计加载失败')
+  }
+}
+
+async function loadMastery() {
+  masteryLoading.value = true
+  try {
+    mastery.value = await request.get(
+      `/banks/${bankId}/mastery`
+    ) as unknown as MasteryReport
+  } catch (e: any) {
+    // 诊断读不到也不该挡住题目列表
+    toast.error(e.message || '掌握度加载失败')
+  } finally {
+    masteryLoading.value = false
+  }
+}
+
+async function resetMastery() {
+  if (resetting.value) return
+  if (!window.confirm('重置后所有知识点的掌握度回到初始值（作答历史保留）。确定吗？')) return
+  resetting.value = true
+  try {
+    await request.delete(`/banks/${bankId}/mastery`)
+    toast.success('诊断已重置')
+    await loadMastery()
+  } catch (e: any) {
+    toast.error(e.message || '重置失败')
+  } finally {
+    resetting.value = false
+  }
+}
+
+// 自适应刷题不走难度预设，直接进练习页由它调 /adaptive-questions 取题。
+// 这里只做一次"能不能出题"的预检，避免进到练习页才发现没标签。
+async function startAdaptive() {
+  if (adaptiveStarting.value) return
+  adaptiveStarting.value = true
+  try {
+    const preview = await request.get(
+      `/banks/${bankId}/adaptive-questions`, { params: { limit: 20 } }
+    ) as unknown as { strategy: string; returned: number; message?: string }
+    if (preview.returned === 0) {
+      toast.error('这个题库暂时出不了题（可能都被斩题了）')
+      return
+    }
+    router.push({ path: '/practice', query: { bank: bankId, source: 'adaptive' } })
+  } catch (e: any) {
+    toast.error(e.message || '自适应选题失败')
+  } finally {
+    adaptiveStarting.value = false
   }
 }
 
@@ -771,7 +962,7 @@ onBeforeUnmount(() => window.clearTimeout(searchTimer))
 
 async function loadAll() {
   loading.value = true
-  await Promise.all([loadBank(), loadStats(), loadQuestions()])
+  await Promise.all([loadBank(), loadStats(), loadQuestions(), loadMastery()])
   loading.value = false
 }
 
@@ -1338,6 +1529,44 @@ function downloadJsonTemplate() {
 .blue { color: #477fbd; background: #e9f2fd; }
 .orange { color: #c17636; background: #fff0df; }
 .practice-grid em { margin-top: auto; color: #9aa59f; font-size: 12px; font-style: normal; }
+
+/* ---------- 认知诊断 ---------- */
+.mastery-section .section-note { margin: 6px 0 0; color: #819088; font-size: 13px; }
+.mastery-summary { display: flex; align-items: center; gap: 14px; }
+.mastery-overall { text-align: right; }
+.mastery-overall-num { display: block; color: #1d775e; font-size: 26px; font-weight: 700; line-height: 1.1; }
+.mastery-overall small { color: #85928b; font-size: 12px; }
+.mastery-hint { border: 1px solid #e1e9e4; border-radius: 10px; padding: 22px; background: #fff; }
+.mastery-hint strong { color: #43564c; }
+.mastery-hint p { margin: 8px 0 0; color: #7d8b83; font-size: 13px; line-height: 1.7; }
+.mastery-hint a { color: #1d775e; }
+.mastery-actions { display: flex; align-items: center; gap: 18px; margin-bottom: 16px; }
+.adaptive-btn { display: flex; align-items: center; gap: 13px; flex: 1; border: 1px solid #cfe3d9; border-radius: 12px; padding: 15px 20px; background: linear-gradient(100deg, #eefaf4, #fff); text-align: left; cursor: pointer; }
+.adaptive-btn:disabled { opacity: .55; cursor: not-allowed; }
+.adaptive-btn strong { display: block; color: #1d5c47; font-size: 15px; }
+.adaptive-btn small { display: block; margin-top: 3px; color: #7d8b83; font-size: 12px; }
+.adaptive-btn i { margin-left: auto; color: #258568; font-style: normal; font-size: 18px; }
+.play-icon { display: grid; place-items: center; width: 34px; height: 34px; border-radius: 50%; color: #fff; background: #258568; font-size: 13px; }
+.mastery-actions-note { margin: 0; color: #85928b; font-size: 12px; }
+.mastery-list { margin: 0; padding: 0; border: 1px solid #e1e9e4; border-radius: 12px; background: #fff; list-style: none; overflow: hidden; }
+.mastery-row { padding: 13px 18px; border-top: 1px solid #f0f4f2; }
+.mastery-row:first-child { border-top: 0; }
+.mastery-row-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.mastery-row-head strong { color: #34473e; font-size: 14px; }
+.mastery-level { border-radius: 20px; padding: 2px 10px; font-size: 11px; font-weight: 600; }
+.lv-mastered .mastery-level { color: #146b4f; background: #dcf5e9; }
+.lv-ok .mastery-level { color: #2c6a9c; background: #e2f0fb; }
+.lv-weak .mastery-level { color: #a5610f; background: #fdefd8; }
+.lv-none .mastery-level { color: #7b8781; background: #eef2f0; }
+.mastery-bar { height: 7px; margin: 9px 0 7px; border-radius: 5px; background: #eef2f0; overflow: hidden; }
+.mastery-bar-fill { display: block; height: 100%; border-radius: 5px; transition: width .3s ease; }
+.lv-mastered .mastery-bar-fill { background: #34a97f; }
+.lv-ok .mastery-bar-fill { background: #5b9bd5; }
+.lv-weak .mastery-bar-fill { background: #e8a33d; }
+.lv-none .mastery-bar-fill { background: #b9c4be; }
+.mastery-row-meta { display: flex; align-items: center; gap: 12px; color: #85928b; font-size: 12px; }
+.mastery-p { color: #43564c; font-weight: 600; font-variant-numeric: tabular-nums; }
+.mastery-foot { margin: 14px 0 0; color: #98a49d; font-size: 12px; line-height: 1.75; }
 .modal-backdrop { position: fixed; z-index: 10; inset: 0; display: grid; place-items: center; padding: 20px; background: rgba(20,45,35,.35); }
 .modal { width: min(100%, 490px); max-height: min(650px, 85vh); overflow: auto; border-radius: 16px; padding: 24px; background: #fff; box-shadow: 0 18px 48px rgba(19,49,37,.2); }
 .modal-head { display: flex; justify-content: space-between; align-items: start; margin-bottom: 20px; }

@@ -74,7 +74,22 @@ def is_useful_kp(name: str) -> bool:
 
 
 def build_tag_prompt(questions: Iterable[Question], subject: str) -> str:
-    """拼打标用的 prompt。"""
+    """拼打标用的 prompt。
+
+    ## 输出示例里的 id 必须用真实题号
+
+    这里踩过一个真实的坑：示例原来是写死的 `{"id":1,...}`。题号从 1 开始的批次
+    看不出问题，但主库里第一批待标注的题号是 2、3、4——4B 的小模型直接把示例里的
+    `id=1` 照抄了回来，于是每一条都因为"题号不在这一批里"被丢掉，
+    整批白跑，而错误信息只说"没有解析出有效知识点"，完全看不出是题号的问题。
+
+    所以示例里的 id 取这一批**第一道题的真实 id**，并额外加一条"照抄题号"的规则。
+    句号后面的兜底在 `parse_tag_response`（未知题号一律丢弃），那是必须保留的
+    安全属性，不能为了容错而放宽。
+    """
+    questions = list(questions)
+    sample_id = questions[0].id if questions else 1
+
     lines = [
         "你是学科教研专家，负责给题库里的题目标注考查的知识点。",
         "",
@@ -84,10 +99,14 @@ def build_tag_prompt(questions: Iterable[Question], subject: str) -> str:
         "   禁止输出「数学」「函数」「考点」这类过于宽泛的词；",
         "3. 知识点名称不要带括号注释、不要带标点；",
         "4. 主考查点 weight 给 1.0，次要考查点给 0.5；",
-        "5. 只输出 JSON，不要输出任何解释文字。",
+        "5. 每道题的 id 必须原样照抄题目行里的 [id=N]，不要自己编号；",
+        "6. 只输出 JSON，不要输出任何解释文字。",
         "",
         "输出格式：",
-        '{"items":[{"id":1,"knowledge_points":[{"name":"二次函数顶点式","weight":1.0}]}]}',
+        f'{{"items":[{{"id":{sample_id},"knowledge_points":'
+        f'[{{"name":"二次函数顶点式","weight":1.0}}]}}]}}',
+        f"（其中 id 要换成每道题自己的题号，例如本题库里就有 "
+        f"{', '.join(str(q.id) for q in questions[:3])} 等题号）",
         "",
         f"学科：{subject}",
         "题目：",
@@ -135,6 +154,25 @@ def _extract_json(raw: str) -> Any:
         except (ValueError, TypeError):
             continue
     return None
+
+
+def _returned_ids(raw: str) -> list[int]:
+    """只把模型返回里的题号抠出来，用于错误信息。
+
+    不判断合法性——恰恰是想看到"模型编了哪些题号"，所以照单全收。
+    """
+    data = _extract_json(raw)
+    items = data.get("items") if isinstance(data, dict) else data
+    if not isinstance(items, list):
+        return []
+    ids: list[int] = []
+    for item in items:
+        if isinstance(item, dict):
+            try:
+                ids.append(int(item.get("id")))
+            except (TypeError, ValueError):
+                continue
+    return ids
 
 
 def parse_tag_response(raw: str, valid_ids: set[int]) -> dict[int, list[dict]]:
@@ -268,6 +306,9 @@ def tag_questions(
 
     `client` 走依赖注入（只要有个 `.chat(model=..., messages=..., format="json")`
     就行），这样单测里可以塞一个假客户端，不用真的跑模型。
+
+    **每批都会 `db.commit()`**，所以这个函数不是原子的：调用方不用再提交一次，
+    但也要知道中途失败会留下已标注的部分（见循环末尾的说明）。
     """
     report = {
         "requested": len(questions),
@@ -301,11 +342,31 @@ def tag_questions(
         parsed = parse_tag_response(raw, {q.id for q in batch})
         if not parsed:
             report["failed_batches"] += 1
-            report["errors"].append(f"第 {report['batches']} 批没有解析出有效知识点")
+            # 把模型实际返回的题号写进错误信息。原来只说"没有解析出有效知识点"，
+            # 而真正的失败原因（模型把示例里的 id=1 照抄回来，题号压根不在这一批里）
+            # 完全看不出来，排查要重新手工跑一遍模型。
+            returned_ids = _returned_ids(raw)
+            report["errors"].append(
+                f"第 {report['batches']} 批没有解析出有效知识点"
+                f"（本批题号 {sorted(q.id for q in batch)}，"
+                f"模型返回的题号 {returned_ids}）"
+            )
             continue
 
         for qid, tags in parsed.items():
             report["links"] += apply_tags(db, qid, tags, subject, source=source)
             report["tagged"] += 1
+
+        # 每批提交一次，而不是等整个请求跑完再提交。
+        #
+        # 为什么必须这样：本地 4B 模型一批 10 道题要 22 秒，标 300 道就是 11 分钟，
+        # 标满 2 万题要十几个小时。只在最后 commit 的话，中间任何一次超时、
+        # 断连或者进程被杀，前面几十分钟的推理结果全部丢掉——而模型调用是
+        # 这整条链路里最贵的一步，重跑一次要再花同样的时间。
+        #
+        # 代价是"一次请求不再是原子操作"：中途失败会留下已经标好的部分。
+        # 这对打标是**可以接受甚至是想要的**——未标注的题会被下一轮
+        # overwrite=false 的调用接着标，天然支持断点续标。
+        db.commit()
 
     return report

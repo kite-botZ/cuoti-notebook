@@ -31,12 +31,39 @@
         <h1>本组题目已完成</h1>
         <p>共 {{ questions.length }} 道题 · 答对 {{ correctCount }} 道 · 答错 {{ wrongCount }} 道</p>
         <div class="status-actions">
+          <button
+            v-if="source === 'adaptive'"
+            class="primary-button"
+            type="button"
+            :disabled="adaptiveLoading"
+            @click="nextAdaptiveBatch"
+          >
+            {{ adaptiveLoading ? '正在选题…' : '按最新掌握度再来一组' }}
+          </button>
           <button class="primary-button" type="button" @click="openGrid">查看全部题目</button>
           <button class="ghost-button" type="button" @click="backToBank">返回题库</button>
         </div>
       </section>
 
       <template v-else-if="currentQuestion">
+        <!-- 自适应练习：说明这批题是按什么选的 -->
+        <section v-if="source === 'adaptive' && adaptiveInfo" class="adaptive-banner">
+          <div class="adaptive-banner-head">
+            <strong>自适应出题</strong>
+            <span class="adaptive-strategy">{{ strategyLabel(adaptiveInfo.strategy) }}</span>
+          </div>
+          <p v-if="adaptiveInfo.message" class="adaptive-banner-msg">{{ adaptiveInfo.message }}</p>
+          <ul v-if="adaptiveInfo.targets.length" class="adaptive-targets">
+            <li v-for="t in adaptiveInfo.targets" :key="t.kp_id">
+              <span class="target-name">{{ t.name }}</span>
+              <span class="target-p">掌握度 {{ t.p_known.toFixed(2) }} · {{ t.level }}</span>
+            </li>
+          </ul>
+          <p v-if="adaptiveInfo.targets.length" class="adaptive-banner-foot">
+            这组题优先从上面这些最薄弱的知识点里出，每题都会标出主考的知识点。
+          </p>
+        </section>
+
         <section class="progress-box">
           <div class="progress-info">
             <span>练习进度</span>
@@ -166,6 +193,28 @@
             ></div>
 
             <p v-if="currentAnswer.explanation" class="result-explanation">{{ currentAnswer.explanation }}</p>
+
+            <!-- 认知诊断：这道题让相关知识点动了多少 -->
+            <div
+              v-if="currentAnswer.masteryChanges && currentAnswer.masteryChanges.length"
+              class="mastery-delta"
+            >
+              <b>知识点掌握度变化</b>
+              <ul>
+                <li v-for="c in currentAnswer.masteryChanges" :key="c.kp_id">
+                  <span class="md-name">{{ c.name }}</span>
+                  <span class="md-num">{{ c.p_before.toFixed(2) }}</span>
+                  <span class="md-arrow" :class="{ up: c.delta > 0, down: c.delta < 0 }">
+                    {{ c.delta > 0 ? '↑' : (c.delta < 0 ? '↓' : '→') }}
+                  </span>
+                  <span class="md-num after">{{ c.p_after.toFixed(2) }}</span>
+                  <span class="md-level">{{ c.level }}</span>
+                  <span v-if="c.weight < 1" class="md-weight">
+                    考查权重 {{ c.weight }}
+                  </span>
+                </li>
+              </ul>
+            </div>
 
             <!-- AI 解析 -->
             <div class="ai-explain-section">
@@ -386,6 +435,17 @@ type CutQuestion = Question & {
   explanation: string
 }
 
+// 作答后服务端返回的掌握度变化（BKT 诊断的结果）
+type MasteryChange = {
+  kp_id: number
+  name: string
+  p_before: number
+  p_after: number
+  delta: number
+  weight: number
+  level: string
+}
+
 type AnswerState = {
   selected: number | number[] | string
   selectedAnswer: string
@@ -393,6 +453,25 @@ type AnswerState = {
   needSelfCheck?: boolean
   correctAnswer: string
   explanation: string
+  masteryChanges?: MasteryChange[]
+}
+
+// 自适应出题的说明：为什么是这批题
+type AdaptiveTarget = {
+  kp_id: number
+  name: string
+  p_known: number
+  level: string
+  need: number
+  question_count: number
+  attempts: number
+}
+
+type AdaptiveInfo = {
+  strategy: string
+  message?: string
+  targets: AdaptiveTarget[]
+  returned: number
 }
 
 const router = useRouter()
@@ -402,6 +481,10 @@ const letters = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H']
 const bankId = Number(route.query.bank || 0)
 const source = String(route.query.source || 'sequential')
 const qtypeFilter = String(route.query.qtype || '')
+
+// 自适应模式每次取多少题。取的是有限的一批，所以在 2 万题的题库上
+// 也不会把整库拉回浏览器——这正是自适应练习顺带解决的问题。
+const ADAPTIVE_BATCH = 20
 
 const loading = ref(true)
 const submitting = ref(false)
@@ -431,6 +514,10 @@ const savingNote = ref(false)
 const showResumePrompt = ref(false)
 const resumeIndex = ref(0)
 const resumeCompleted = ref(0)
+
+// 自适应出题
+const adaptiveInfo = ref<AdaptiveInfo | null>(null)
+const adaptiveLoading = ref(false)
 
 // AI 解析
 const aiExplaining = ref(false)
@@ -507,6 +594,14 @@ function isCorrectOption(q: CutQuestion, index: number) {
 async function loadQuestions() {
   loading.value = true
   try {
+    // 自适应出题单独走一条路：题单由服务端按薄弱知识点挑，而且只是有限的一批。
+    // 不走列表接口，所以下面那套"拉全量再本地过滤"的逻辑都跟它无关。
+    if (source === 'adaptive') {
+      await loadAdaptive()
+      loading.value = false
+      return
+    }
+
     // 先查后端保存的进度
     let savedProgress: any = null
     try {
@@ -583,6 +678,60 @@ async function loadQuestions() {
 }
 
 onMounted(loadQuestions)
+
+/**
+ * 自适应出题：取一批最薄弱知识点的题，并记下"为什么是它们"。
+ *
+ * 不保存进度、也不做本地过滤。理由：题单本身是服务端按当下的掌握度算出来的，
+ * 下次进来掌握度已经变了，恢复上次的题单反而会让"自适应"名不副实。
+ */
+async function loadAdaptive() {
+  adaptiveLoading.value = true
+  try {
+    const res = await request.get(`/banks/${bankId}/adaptive-questions`, {
+      params: { limit: ADAPTIVE_BATCH },
+    }) as unknown as AdaptiveInfo & { picked: (Question & { reason: string })[] }
+
+    adaptiveInfo.value = {
+      strategy: res.strategy,
+      message: res.message,
+      targets: res.targets || [],
+      returned: res.returned,
+    }
+    questions.value = res.picked || []
+    answers.value = {}
+    currentIndex.value = 0
+    selected.value = null
+    textInput.value = ''
+    showCompletion.value = false
+
+    if (!questions.value.length) {
+      toast.error('这个题库暂时出不了题')
+    } else if (res.strategy === 'no_kp_fallback') {
+      toast.warning('题库还没有知识点标注，已按「没做过的题优先」出题')
+    }
+  } catch (e: any) {
+    toast.error(e.message || '自适应选题失败')
+  } finally {
+    adaptiveLoading.value = false
+  }
+}
+
+/** 一组做完了再来一组：重新按最新掌握度选题。 */
+async function nextAdaptiveBatch() {
+  showCompletion.value = false
+  await loadAdaptive()
+}
+
+/** 把后端给的策略名翻成人话，直接显示在页面上 */
+function strategyLabel(strategy: string) {
+  const map: Record<string, string> = {
+    bkt_adaptive: '按薄弱知识点出题',
+    bkt_adaptive_with_fill: '薄弱知识点的题不够，已用没做过的题补齐',
+    no_kp_fallback: '题库未标注知识点，按没做过的题优先',
+  }
+  return map[strategy] || strategy
+}
 
 watch(currentIndex, (idx) => {
   const q = questions.value[idx]
@@ -703,6 +852,7 @@ async function submitAnswer() {
       need_self_check?: boolean
       correct_answer: string
       explanation: string
+      mastery_changes?: MasteryChange[]
     }
 
     answers.value[q.id] = {
@@ -712,6 +862,10 @@ async function submitAnswer() {
       needSelfCheck: res.need_self_check || false,
       correctAnswer: res.correct_answer,
       explanation: res.explanation,
+      // 服务端在判题的同一次请求里就把掌握度更新完了，变化明细跟着回来。
+      // 不这么做的话前端答完还要再发一个请求去问"现在掌握度多少"，
+      // 而且中间那一瞬间页面上的数字是旧的。
+      masteryChanges: res.mastery_changes || [],
     }
 
     scheduleSave()
@@ -886,6 +1040,12 @@ let saveTimer: number | null = null
 
 function scheduleSave() {
   if (!questions.value.length) return
+
+  // 自适应模式不存进度：题单是服务端按"当下"的掌握度算出来的，下次进来
+  // 掌握度已经变了，恢复旧题单反而让自适应名不副实。而且每次进来都会
+  // 重新选题，存下来的那批 id 永远不会被读到——白写一份 JSON 进库。
+  if (source === 'adaptive') return
+
   if (saveTimer) window.clearTimeout(saveTimer)
   saveTimer = window.setTimeout(async () => {
     try {
@@ -1125,6 +1285,126 @@ function backToBank() {
   border-radius: 14px;
   background: #fff;
   margin-bottom: 20px;
+}
+
+/* ---------- 自适应出题说明 ---------- */
+.adaptive-banner {
+  padding: 16px 20px;
+  border: 1px solid #cfe3d9;
+  border-radius: 14px;
+  background: linear-gradient(100deg, #effaf4, #fff);
+  margin-bottom: 20px;
+}
+.adaptive-banner-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.adaptive-banner-head strong {
+  color: #1d5c47;
+  font-size: 14px;
+}
+.adaptive-strategy {
+  border-radius: 20px;
+  padding: 2px 10px;
+  color: #146b4f;
+  background: #dcf5e9;
+  font-size: 11px;
+  font-weight: 600;
+}
+.adaptive-banner-msg {
+  margin: 10px 0 0;
+  color: #7d8b83;
+  font-size: 13px;
+  line-height: 1.7;
+}
+.adaptive-targets {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 12px 0 0;
+  padding: 0;
+  list-style: none;
+}
+.adaptive-targets li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid #dce9e2;
+  border-radius: 8px;
+  padding: 6px 11px;
+  background: #fff;
+}
+.target-name {
+  color: #34473e;
+  font-size: 13px;
+  font-weight: 600;
+}
+.target-p {
+  color: #85928b;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+.adaptive-banner-foot {
+  margin: 11px 0 0;
+  color: #98a49d;
+  font-size: 12px;
+}
+
+/* ---------- 答后掌握度变化 ---------- */
+.mastery-delta {
+  margin-top: 16px;
+  padding: 13px 16px;
+  border: 1px solid #e3ece7;
+  border-radius: 10px;
+  background: #f8fbf9;
+}
+.mastery-delta b {
+  color: #43564c;
+  font-size: 13px;
+}
+.mastery-delta ul {
+  margin: 9px 0 0;
+  padding: 0;
+  list-style: none;
+}
+.mastery-delta li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 0;
+  font-size: 13px;
+}
+.md-name {
+  color: #34473e;
+}
+.md-num {
+  color: #7d8b83;
+  font-variant-numeric: tabular-nums;
+}
+.md-num.after {
+  color: #1f6956;
+  font-weight: 650;
+}
+.md-arrow {
+  color: #98a49d;
+}
+.md-arrow.up {
+  color: #2a9d78;
+}
+.md-arrow.down {
+  color: #c25a4d;
+}
+.md-level {
+  border-radius: 20px;
+  padding: 1px 8px;
+  color: #55645c;
+  background: #eef2f0;
+  font-size: 11px;
+}
+.md-weight {
+  color: #a0aaa5;
+  font-size: 11px;
 }
 .progress-info {
   display: flex;

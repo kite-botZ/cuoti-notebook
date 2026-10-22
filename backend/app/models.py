@@ -205,6 +205,65 @@ class QuestionKnowledgePoint(Base):
     created_at = Column(DateTime, server_default=func.now())
 
 
+class UserKpMastery(Base):
+    """某个用户对某个知识点的掌握度——认知诊断的结论就存在这张表里。
+
+    ## 为什么不是算出来就行，非要落库
+
+    掌握度是**在线增量**更新的：每答一题，只把受影响的几个知识点推进一小步。
+    如果每次都从 `answer_attempts` 全量重算，随着作答记录增长会越来越慢，
+    而且重算必须把历史的作答顺序也复现出来（BKT 是非交换的，先错后对和先对后错
+    结果不同），代价远大于增量更新。
+
+    增量更新也意味着这张表是**可以被重放的**：诊断逻辑一旦改了参数或公式，
+    清空这张表、按 `answer_attempts` 的时间顺序重放即可，不需要额外的手工修数据。
+
+    ## p_known 的语义
+
+    `p_known` 是 BKT 的隐状态后验：**这个知识点已掌握的概率**，恒在 [0.01, 0.99]。
+    它不等于正确率，所以这里同时存 `attempts` / `correct`，前端两个都能展示，
+    也方便核对"掌握度是不是被某一道题带偏了"。
+
+    ## 为什么 (user_id, kp_id) 唯一，而不带 bank_id
+
+    知识点是学科层面的公共分类（见 `KnowledgePoint` 的说明），同一个知识点
+    可能被多个题库的题考到。掌握度跟着**人和知识点**走，不跟着题库走：
+    学生在题库 A 练会了「二次函数顶点式」，在题库 B 里再做同类题时，
+    初始掌握度就不该再从 0.30 重新开始。带 bank_id 会让同一份能力被拆成几份，
+    诊断结果互相矛盾。
+    """
+
+    __tablename__ = "user_kp_mastery"
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "kp_id", name="uq_user_kp_mastery"),
+        # 自适应选题固定按 user_id 过滤、按 p_known 升序挑最弱的知识点，
+        # 所以建联合索引；user_id 是它的最左前缀，不再单独建单列索引。
+        Index("ix_mastery_user_p", "user_id", "p_known"),
+    )
+
+    id = Column(BigInteger().with_variant(Integer, "sqlite"), primary_key=True, autoincrement=True)
+    user_id = Column(
+        BigInteger, ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    # kp_id 上不再 `index=True`：唯一约束 uq_user_kp_mastery 的最左前缀是 user_id，
+    # 但 MySQL 会为它建一个 (user_id, kp_id) 索引，按 kp_id 单查虽然用不上前缀，
+    # 诊断里也没有"按 kp_id 反查所有用户"的场景，多一个单列索引只是多一份写开销。
+    kp_id = Column(
+        BigInteger, ForeignKey("knowledge_points.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+
+    p_known = Column(Float, nullable=False, default=0.30)
+    attempts = Column(Integer, nullable=False, default=0)   # 影响过这个知识点的作答次数
+    correct = Column(Integer, nullable=False, default=0)
+
+    # 最近一次作答时间。自适应选题用它避免"刚做过又推给你"，
+    # 也留着以后做遗忘衰减（decay）用——现在没做，别假装做了。
+    last_answered_at = Column(DateTime, nullable=True)
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+
 # ============================================================
 # 知识库文档（RAG 的语料来源）
 # ============================================================

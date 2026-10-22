@@ -7,7 +7,8 @@ from app import models  # noqa: F401
 from app.cache import cache
 from app.db import Base, engine
 from app.routes import (
-    auth, banks, daily, import_questions, knowledge, practice, rag, stats, upload, user, ai,
+    auth, banks, daily, import_questions, knowledge, mastery, practice, rag, stats, upload,
+    user, ai,
 )
 
 app = FastAPI(title="错题本 API")
@@ -35,6 +36,7 @@ app.include_router(daily.router)
 app.include_router(import_questions.router)
 app.include_router(knowledge.router)
 app.include_router(rag.router)
+app.include_router(mastery.router)
 
 
 @app.get("/")

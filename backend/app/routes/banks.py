@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session
 
 from app.cache import QLIST_TTL, cache
 from app.db import get_db
+from app.mastery import attach_kp_names, record_attempt
 from app.models import AnswerAttempt, Question, QuestionBank, QuestionUserState
 from app.security import ALGORITHM, SECRET_KEY
 
@@ -729,6 +730,14 @@ def submit_answer(
         state = get_or_create_state(user_id, question.id, db)
         state.wrong_count = (state.wrong_count or 0) + 1
 
+    # 认知诊断：这次作答让相关知识点的掌握度变化多少。
+    # 自评题也一样要更新——自评结果是用户自己给的判断，仍是关于"会不会"的证据；
+    # 而且跳过它会让"上传了图片的解答"永远不影响诊断。
+    mastery_changes = attach_kp_names(
+        db,
+        record_attempt(db, user_id, question, is_correct),
+    )
+
     db.commit()
 
     return {
@@ -737,6 +746,9 @@ def submit_answer(
         "correct_answer": question.correct_answer,
         "explanation": question.explanation,
         "answered_at": int(time.time()),
+        # 掌握度变化随判题结果一起返回：前端答完立刻能显示
+        # "「TCP 拥塞控制」0.42 → 0.53"，诊断有没有真的在动，一眼可见
+        "mastery_changes": mastery_changes,
     }
 
 

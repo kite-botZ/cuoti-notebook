@@ -15,6 +15,7 @@ import json
 import re
 
 import pytest
+from sqlalchemy import select
 
 from app.knowledge import (
     apply_tags,
@@ -72,6 +73,30 @@ def test_build_tag_prompt_contains_every_question():
     assert "只输出 JSON" in prompt
 
 
+def test_build_tag_prompt_example_uses_real_question_id():
+    """输出示例里的 id 必须是这一批真实存在的题号。
+
+    这条盯的是一个真实踩过的坑：示例原本写死 `"id":1`。4B 的小模型会直接
+    照抄示例里的 1，而主库那时待标注的题号是 2、3、4，于是每条都因为
+    "题号不在本批"被丢掉，整批白跑（模型推理一次 20 多秒）。
+    示例里的 id 取自本批第一题之后，照抄至少也能命中一道。
+    """
+    class Q:
+        def __init__(self, i):
+            self.id, self.stem, self.options, self.question_type = i, f"题{i}", [], "single"
+
+    prompt = build_tag_prompt([Q(7), Q(8)], "数学")
+    assert '"id":7' in prompt, "示例里的 id 应该是本批第一题的真实题号"
+    assert '"id":1' not in prompt, "不能再出现写死的 id=1"
+    assert "原样照抄" in prompt, "要有明确的'照抄题号'规则"
+
+
+def test_build_tag_prompt_handles_empty_batch():
+    """空批次不能炸（会取 questions[0]）。"""
+    prompt = build_tag_prompt([], "综合")
+    assert "输出格式" in prompt
+
+
 # ---------- 模型输出解析：各种不听话的情况 ----------
 
 def test_parse_plain_json():
@@ -100,6 +125,24 @@ def test_parse_drops_unknown_ids():
     """模型编了个不存在的 id，必须丢掉。"""
     raw = '{"items":[{"id":999,"knowledge_points":[{"name":"不存在的题"}]}]}'
     assert parse_tag_response(raw, {1, 2}) == {}
+
+
+def test_returned_ids_reports_what_the_model_actually_said():
+    """`_returned_ids` 要如实报告模型编的题号，用于错误信息。
+
+    这条是为了让"整批解析失败"可诊断。真实案例：模型把示例里的 id=1 照抄回来，
+    而本批题号是 2、3、4；原来错误信息只说"没有解析出有效知识点"，
+    完全看不出是题号的问题，得重新手工跑一次模型才能定位。
+    """
+    from app.knowledge import _returned_ids
+
+    raw = '{"items":[{"id":1,"knowledge_points":[{"name":"加法"}]},' \
+          '{"id":1,"knowledge_points":[{"name":"算术"}]}]}'
+    assert _returned_ids(raw) == [1, 1]
+    assert parse_tag_response(raw, {2, 3, 4}) == {}
+    # 夹着乱七八糟的东西也不能崩
+    assert _returned_ids("随便一段话") == []
+    assert _returned_ids('[{"id":"x"},{"no_id":1}]') == []
 
 
 def test_parse_drops_broad_names():
@@ -266,6 +309,57 @@ def test_tag_questions_survives_one_bad_batch(db, created_bank):
     assert report["failed_batches"] == 1
     assert report["tagged"] == 2           # 第二批成功
     assert "模型超时" in report["errors"][0]
+
+
+def test_tag_questions_commits_each_batch(db, created_bank):
+    """每批都要落库：标到一半被打断，前面已经标好的不能丢。
+
+    验证方式是**另开一个 session** 去查。只看当前 session 是测不出来的：
+    没提交的改动在当前 session 里照样查得到，只有同库的另一个连接看不到。
+    本地 4B 模型一批 10 道题要 22 秒，标 2 万题要十几个小时，
+    中间断一次就全白干是不能接受的。
+    """
+    from app.db import SessionLocal
+    from app.models import Question, QuestionKnowledgePoint
+
+    class CountingClient:
+        def __init__(self):
+            self.n = 0
+
+        def chat(self, **kwargs):
+            self.n += 1
+            if self.n == 3:                 # 第三批挂掉
+                raise RuntimeError("第三批超时")
+            prompt = kwargs["messages"][0]["content"]
+            ids = [int(x) for x in re.findall(r"\[id=(\d+)\]", prompt)]
+            return {"message": {"content": json.dumps(
+                {"items": [{"id": i, "knowledge_points": [{"name": f"KP{i}"}]}
+                           for i in ids]})}}
+
+    for i in range(6):
+        db.add(Question(bank_id=created_bank["id"], stem=f"题{i}",
+                        question_type="single", options=["a", "b"],
+                        correct_answer="A", explanation=""))
+    db.commit()
+    questions = db.query(Question).filter(Question.bank_id == created_bank["id"]).all()
+
+    report = tag_questions(db=db, questions=questions, subject="综合",
+                          client=CountingClient(), model="fake", batch_size=2)
+    assert report["tagged"] == 4, "前两批应该成功"
+    assert report["failed_batches"] == 1
+
+    # 关键：换一个 session 看，前两批的结果必须已经在库里
+    other = SessionLocal()
+    try:
+        links = (
+            other.query(QuestionKnowledgePoint)
+            .filter(QuestionKnowledgePoint.question_id.in_(
+                select(Question.id).where(Question.bank_id == created_bank["id"])))
+            .count()
+        )
+    finally:
+        other.close()
+    assert links == 4, f"前两批的标注没落库（另一个 session 只看到 {links} 条）"
 
 
 # ============================================================
