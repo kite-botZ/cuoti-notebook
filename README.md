@@ -1,4 +1,4 @@
-﻿# 错题本 · 智能刷题系统
+# 错题本 · 智能刷题系统
 
 > 一个可以自己出题、自动判分、自动收集错题，用**本地大模型**讲题，
 > 并按**知识点掌握度**决定下一题刷什么的刷题系统。
@@ -39,8 +39,11 @@
 git clone https://github.com/kite-botZ/cuoti-notebook.git
 cd cuoti-notebook
 
-# 2. 准备配置（默认值就能跑，不用改）
+# 2. 准备配置，并把自己的 MySQL 密码填进去
 cp .env.example .env
+#    编辑 .env，把 DB_PASSWORD 改成你自己的密码（示例里是占位符，别照抄）
+#    顺手把 JWT_SECRET_KEY 也换掉：
+#    python3 -c "import secrets; print(secrets.token_urlsafe(48))"
 
 # 3. 一键启动（MySQL + Redis + 后端 + 前端）
 docker compose up -d --build
@@ -48,6 +51,10 @@ docker compose up -d --build
 # 4. 确认四个容器都起来了
 docker compose ps
 ```
+
+> ⚠️ `.env.example` 里的 `DB_PASSWORD` 是**占位符，必须改**——
+> 那个文件是公开的，照抄等于用了一个所有人都知道的密码。
+> 这个密码会同时作为 MySQL 的 root 密码（见 `docker-compose.yml` 的 `MYSQL_ROOT_PASSWORD`）。
 
 浏览器打开 **<http://localhost:8080>** → 点「注册」建个账号 → 开始用。
 
