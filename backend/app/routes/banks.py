@@ -8,8 +8,9 @@ import jwt
 from dotenv import load_dotenv
 from fastapi import APIRouter, Depends, HTTPException, Response, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import case, func, or_
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.cache import QLIST_TTL, cache
@@ -40,20 +41,43 @@ class QuestionCreate(BaseModel):
     stem: str = Field(min_length=1)
     question_type: str = Field(default="single")
     options: list[str] = Field(default_factory=list)
-    correct_answer: str = Field(min_length=1)
+    # 255 = questions.correct_answer 的真实宽度。
+    # 不做校验的话，超长答案会撞 MySQL 1406 → 500（建题失败、用户看不懂）；
+    # 加了限制就是 422 + 明确提示。
+    correct_answer: str = Field(min_length=1, max_length=255)
     explanation: str = ""
+
+    @field_validator("stem", "correct_answer")
+    @classmethod
+    def _not_blank(cls, v: str) -> str:
+        """只含空白的题干/答案不算填了。
+
+        `min_length=1` 挡不住 "   "（长度是 3），而建题时又会 `.strip()`，
+        于是库里存进一道 stem='' 的题——列表里就是一条空白记录，
+        点进去也没有题干。这里先 strip 再判空，直接 422。
+        """
+        v = v.strip()
+        if not v:
+            raise ValueError("不能只填空格")
+        return v
 
 
 class QuestionUpdate(BaseModel):
     stem: str | None = None
     question_type: str | None = None
     options: list[str] | None = None
-    correct_answer: str | None = None
+    correct_answer: str | None = Field(default=None, max_length=255)
     explanation: str | None = None
 
 
 class AnswerCreate(BaseModel):
-    selected_answer: str = ""
+    # 500 = answer_attempts.selected_answer 的真实宽度。
+    # 原先是无限制字符串：501 字的答案会 500 并把这次作答整体回滚
+    # （判分结果、历史记录、掌握度更新全丢），改成 422 提前挡住。
+    selected_answer: str = Field(default="", max_length=500)
+    # 自评题的判定结果。前端在"答案里带图片、系统判不了分"时，可以让用户
+    # 自己说答对没答对；不传表示"还没自评"，那就当作没有证据（见 submit_answer）。
+    self_correct: bool | None = None
 
 
 class NoteBody(BaseModel):
@@ -117,6 +141,37 @@ def ensure_question_owned(question_id: int, user_id: int, db: Session) -> Questi
 
 
 def get_or_create_state(user_id: int, question_id: int, db: Session) -> QuestionUserState:
+    """取（必要时创建）某个用户对某道题的作答状态。
+
+    ## 这里必须是并发安全的
+
+    原来的实现是 `SELECT → INSERT → db.commit()`，有两个真问题：
+
+    1. **并发撞唯一约束直接 500，并且把这次作答一起丢掉。**
+       同一道题被并发提交（连点两次「提交」、前端重试、双击收藏）时，
+       两个请求都可能查不到状态、于是都想 INSERT，其中一个必然撞
+       `uq_user_question` → `IntegrityError` → 500。实测同一题 8 并发提交，
+       24 次里只有 3 次真的入库：**作答记录、wrong_count、BKT 掌握度更新全丢了**，
+       而用户看到的是一个错误提示。
+    2. **内部那个 commit 破坏了调用方的事务原子性。**
+       `submit_answer` 想表达的是"写作答记录 + 更新 wrong_count + 更新掌握度"
+       一个原子操作，但辅助函数里的 commit 会把它提前提交掉。
+       （`mastery.record_attempt` 的注释也是按"同一个事务"写的。）
+
+    ## 现在的做法
+
+    查不到就插，插入用 SAVEPOINT 包住：撞唯一约束时**只回滚这一条 INSERT**，
+    调用方事务里已有的作答记录不受影响，然后重读拿到对方建好的那一行。
+
+    重读**必须用行锁**（`SELECT ... FOR UPDATE`）：本事务的快照建立在这个请求刚开始时，
+    而对方是之后才提交的，MySQL 在 REPEATABLE READ 下普通 SELECT 看不到它。
+    行锁读的是"最新已提交"的版本，所以能看到。
+
+    注意快路径上**不加锁**：状态还不存在时对不存在的行加锁会拿间隙锁，
+    两个并发请求很容易互相等成死锁，所以只有"插入失败后的重读"才需要 FOR UPDATE。
+
+    事务边界留给调用方（所有调用点都在自己最后 commit），这里不再 commit。
+    """
     state = (
         db.query(QuestionUserState)
         .filter(
@@ -125,11 +180,26 @@ def get_or_create_state(user_id: int, question_id: int, db: Session) -> Question
         )
         .first()
     )
-    if not state:
-        state = QuestionUserState(user_id=user_id, question_id=question_id)
-        db.add(state)
-        db.commit()
-        db.refresh(state)
+    if state:
+        return state
+
+    try:
+        with db.begin_nested():
+            db.add(QuestionUserState(user_id=user_id, question_id=question_id))
+    except IntegrityError:
+        # 并发下另一个请求先建好了这一行，这不是错误——下面重读即可
+        pass
+
+    query = db.query(QuestionUserState).filter(
+        QuestionUserState.user_id == user_id,
+        QuestionUserState.question_id == question_id,
+    )
+    if db.get_bind().dialect.name != "sqlite":
+        query = query.with_for_update()
+    state = query.first()
+
+    if state is None:  # 理论上到不了这里；真到了也不能把这次作答静默吞掉
+        raise HTTPException(status_code=500, detail="作答状态初始化失败，请重试")
     return state
 
 
@@ -390,6 +460,7 @@ def list_questions(
     q: str | None = None,
     ids: str | None = None,
     has_image: bool | None = None,
+    exclude_cut: bool | None = None,
     page: int | None = None,
     page_size: int = 50,
     user_id: int = Depends(current_user_id),
@@ -471,6 +542,7 @@ def list_questions(
         and not keyword
         and not id_list
         and has_image is None
+        and not exclude_cut
     )
 
     if use_cache:
@@ -530,6 +602,16 @@ def list_questions(
             query = query.filter(QuestionUserState.is_cut.is_(True))
         elif filter_type == "note":
             query = query.filter(QuestionUserState.note != "")
+
+        # 练习范围要排除"本人已斩题"。这个问题之前是漏的：
+        # /question-stats 的计数（和自适应选题 mastery.available_questions_query）
+        # 都用 is_cut.isnot(True) 排除了斩题，只有列表接口没跟上，
+        # 于是「我的错题 12 道」点进去却有 14 道、顺序练习也会刷到斩过的题。
+        #
+        # 这里做成**显式开关**而不是默认行为：题库管理页需要看到斩题
+        # （否则没法取消斩题），「我的斩题」弹窗更是专门只要斩题。
+        if exclude_cut:
+            query = query.filter(QuestionUserState.is_cut.isnot(True))
 
         if question_type:
             query = query.filter(Question.question_type == question_type)
@@ -672,6 +754,7 @@ def question_ids(
     filter_type: str | None = None,
     question_type: str | None = None,
     has_image: bool | None = None,
+    exclude_cut: bool | None = None,
     user_id: int = Depends(current_user_id),
     db: Session = Depends(get_db),
 ):
@@ -721,6 +804,12 @@ def question_ids(
     elif filter_type == "note":
         query = query.filter(QuestionUserState.note != "")
 
+    # 与 list_questions 的 exclude_cut 完全同口径：
+    # 随机练习/打乱题序走的就是这个接口，不排除斩题的话，
+    # "打乱后冒出已经斩过的题"会立刻被用户发现。
+    if exclude_cut:
+        query = query.filter(QuestionUserState.is_cut.isnot(True))
+
     if question_type:
         query = query.filter(Question.question_type == question_type)
     if has_image is not None:
@@ -759,6 +848,35 @@ def create_question(
     # 写后失效：版本号 +1，该题库的题目列表缓存key全部作废
     cache.bump_bank_version(bank_id)
     return question_payload(question)
+
+
+@router.get("/questions/{question_id}")
+def get_question(
+    question_id: int,
+    user_id: int = Depends(current_user_id),
+    db: Session = Depends(get_db),
+):
+    """取单题详情，**带正确答案与解析**。
+
+    为什么需要这个接口：列表接口为了不把答案发给正在做题的人，
+    只有 `filter_type=cut` 那一支才带答案（见 list_questions）。
+    但「编辑题目」必须能看到原答案与解析——否则前端拿不到答案就回填空串，
+    用户保存时会把原有解析一起清掉（`QuestionUpdate.explanation` 传空串即清空）。
+    所以编辑这条路径走这个接口，而不是去列表里翻。
+
+    `GET /api/banks/{bank_id}/questions?ids=...` 不带答案这条设计保留不动：
+    它服务于练习场景，答案不能顺手发出去。
+    """
+    question = ensure_question_owned(question_id, user_id, db)
+    state = (
+        db.query(QuestionUserState)
+        .filter(
+            QuestionUserState.user_id == user_id,
+            QuestionUserState.question_id == question_id,
+        )
+        .first()
+    )
+    return question_payload_with_state(question, state, include_answer=True)
 
 
 @router.put("/questions/{question_id}")
@@ -833,14 +951,28 @@ def submit_answer(
 
     need_self_check = False
     is_correct = False
+    # 这次作答有没有"可信的判定结果"。上传图片但没有自评时为 False：
+    # 既不该记成答错，也不该写进正确率，更不该喂给认知诊断。
+    assessed = True
 
     if user_has_image:
         need_self_check = True
+        if body.self_correct is None:
+            # 系统判不了分、用户也没自评 → 这次不算证据，不落答题历史。
+            # 落一行 is_correct=False 的话，错题本说"没错"、统计说"错了"、
+            # 诊断说"掌握度下降"，同一道题三处口径互相矛盾。
+            assessed = False
+        else:
+            is_correct = bool(body.self_correct)
     elif question.question_type == "multiple":
         correct_set = set(correct_str.upper())
         user_set = set(user_ans.upper())
         is_correct = (correct_set == user_set)
-    elif question.question_type in ("short", "calc"):
+    elif question.question_type in ("short", "calc", "blank"):
+        # 填空也要宽松匹配：用户填「未找到。」而标准答案是「未找到」时，
+        # 差一个句号就判错、进错题本、还拖累掌握度——这正是这个项目
+        # 声称要避免的误判（README 里写的就是"填空/简答/计算做宽松匹配"）。
+        # 之前这里漏了 blank，落到下面的精确比较分支，是个真 bug。
         def normalize(s: str) -> str:
             s = s.strip().lower()
             s = re.sub(r"\s+", "", s)
@@ -850,14 +982,15 @@ def submit_answer(
     else:
         is_correct = user_ans.upper() == correct_str.upper()
 
-    # 写答题历史
-    attempt = AnswerAttempt(
-        user_id=user_id,
-        question_id=question.id,
-        selected_answer=user_ans or "(空)",
-        is_correct=is_correct,
-    )
-    db.add(attempt)
+    # 写答题历史（没有判定结果的作答不写，避免污染正确率）
+    if assessed:
+        attempt = AnswerAttempt(
+            user_id=user_id,
+            question_id=question.id,
+            selected_answer=user_ans or "(空)",
+            is_correct=is_correct,
+        )
+        db.add(attempt)
 
     # 自评题不算错，其他答错才 +1
     if not is_correct and not need_self_check:
@@ -865,11 +998,12 @@ def submit_answer(
         state.wrong_count = (state.wrong_count or 0) + 1
 
     # 认知诊断：这次作答让相关知识点的掌握度变化多少。
-    # 自评题也一样要更新——自评结果是用户自己给的判断，仍是关于"会不会"的证据；
-    # 而且跳过它会让"上传了图片的解答"永远不影响诊断。
+    # 自评题带上用户的自评结果一起更新——自评是用户自己给的判断，仍是
+    # 关于"会不会"的证据；但**没自评**时必须传 None 让它跳过，
+    # 而不是拿 False 冒名顶替（见 record_attempt 的说明）。
     mastery_changes = attach_kp_names(
         db,
-        record_attempt(db, user_id, question, is_correct),
+        record_attempt(db, user_id, question, is_correct if assessed else None),
     )
 
     db.commit()
@@ -877,6 +1011,10 @@ def submit_answer(
     return {
         "correct": is_correct,
         "need_self_check": need_self_check,
+        # False = 这次作答没有被判分（系统判不了、用户也没自评），
+        # 因此它既没进错题本、也没进正确率、更没有改变掌握度。
+        # 前端据此显示"待你确认对错"，而不是把它当成一次答错。
+        "assessed": assessed,
         "correct_answer": question.correct_answer,
         "explanation": question.explanation,
         "answered_at": int(time.time()),

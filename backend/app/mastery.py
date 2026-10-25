@@ -112,16 +112,26 @@ def record_attempt(
     db: Session,
     user_id: int,
     question: Question,
-    is_correct: bool,
+    is_correct: bool | None,
 ) -> list[dict]:
     """把一次作答的影响写到该题关联的每个知识点上。
 
     返回本次每个知识点的掌握度变化，前端可以直接显示"这道题让
     「TCP 拥塞控制」从 0.42 涨到 0.53"——诊断是不是真的在动，看得见。
 
+    `is_correct=None` 表示**这次作答不构成证据**（最典型的是用户上传了图片
+    草稿、系统无法自动判分、用户也还没自评）。这种情况必须原样返回空列表、
+    不动任何数字：调用方原先只能传 True/False，于是"没判分"被迫写成 False，
+    一次上传图片就会被当成答错喂进 BKT——实测某知识点掌握度从 0.30 掉到
+    0.1959，"上传了草稿"反而被诊断为"不会"，还会污染 attempts/correct 的
+    证据计数。
+
     注意：调用方负责 `db.commit()`。这里不提交，是为了让"写答题历史 +
     更新错题计数 + 更新掌握度"落在同一个事务里，避免只写了一半。
     """
+    if is_correct is None:
+        return []
+
     links = (
         db.query(QuestionKnowledgePoint)
         .filter(QuestionKnowledgePoint.question_id == question.id)

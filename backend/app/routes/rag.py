@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import os
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Response, UploadFile
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
@@ -51,7 +51,7 @@ class SearchBody(BaseModel):
     min_coverage: float = Field(default=DEFAULT_MIN_COVERAGE, ge=0.0, le=1.0)
 
 
-def _doc_payload(doc: KnowledgeDocument) -> dict:
+def _doc_payload(doc: KnowledgeDocument, viewer_id: int | None = None) -> dict:
     return {
         "id": doc.id,
         "title": doc.title,
@@ -65,6 +65,11 @@ def _doc_payload(doc: KnowledgeDocument) -> dict:
         "error": doc.error,
         "embed_model": doc.embed_model,
         "created_at": str(doc.created_at) if doc.created_at else None,
+        # 讲义正文是全局共享的语料（README 里就是这么写的，检索也是全库检索），
+        # 但"共享"只该包含读，不该包含删。所以把归属回传给前端：
+        # 不是我传的文档，界面上不该出现删除按钮。
+        "uploaded_by": doc.uploaded_by,
+        "can_delete": viewer_id is not None and doc.uploaded_by == viewer_id,
     }
 
 
@@ -74,6 +79,7 @@ def _doc_payload(doc: KnowledgeDocument) -> dict:
 
 @router.post("/knowledge-docs", status_code=201)
 def upload_document(
+    response: Response,
     file: UploadFile = File(...),
     title: str = Form(default=""),
     subject: str = Form(default="综合"),
@@ -112,9 +118,14 @@ def upload_document(
         ai_api_base=AI_API_BASE,
     )
 
-    payload = _doc_payload(doc)
+    payload = _doc_payload(doc, user_id)
     if doc.status == "failed":
-        # 入库失败也要把原因原样告诉用户（扫描件 / 乱码 / 切分失败）
+        # 入库失败也要把原因原样告诉用户（扫描件 / 乱码 / 切分失败）。
+        #
+        # 但状态码必须是失败：装饰器写死的 201 Created 会一路带到这里，
+        # 于是"入库失败"也回 201——监控、脚本、axios 都只能看出"成功"。
+        # 现在改成 422，body 结构不变（前端按 status 字段判断，读得到 message）。
+        response.status_code = 422
         payload["message"] = f"入库失败（{doc.failed_stage}）：{doc.error}"
         return payload
     payload["message"] = (
@@ -127,13 +138,14 @@ def upload_document(
 @router.get("/knowledge-docs")
 def list_documents(
     subject: str | None = None,
+    user_id: int = Depends(current_user_id),
     db: Session = Depends(get_db),
 ):
     query = db.query(KnowledgeDocument)
     if subject:
         query = query.filter(KnowledgeDocument.subject == subject)
     rows = query.order_by(KnowledgeDocument.id.desc()).all()
-    return [_doc_payload(d) for d in rows]
+    return [_doc_payload(d, user_id) for d in rows]
 
 
 @router.delete("/knowledge-docs/{doc_id}")
@@ -142,8 +154,16 @@ def delete_document(
     user_id: int = Depends(current_user_id),
     db: Session = Depends(get_db),
 ):
+    """删除一份讲义——**只有上传者本人能删**。
+
+    这里原先只按 id 查、不校验归属，任何登录用户都能把别人上传的讲义连
+    chunk 一起删掉（实测 B 账号删 A 的文档返回 200，A 再读就 404 了）。
+    越权一律按 404 处理，和题库侧的口径保持一致（不暴露"这个 id 存在"）。
+    """
     doc = db.query(KnowledgeDocument).filter(KnowledgeDocument.id == doc_id).first()
     if not doc:
+        raise HTTPException(status_code=404, detail="文档不存在")
+    if doc.uploaded_by != user_id:
         raise HTTPException(status_code=404, detail="文档不存在")
     db.delete(doc)          # chunk 由外键 CASCADE 一起删
     db.commit()
@@ -154,6 +174,7 @@ def delete_document(
 def list_chunks(
     doc_id: int,
     limit: int = Query(default=5, ge=1, le=50),
+    user_id: int = Depends(current_user_id),
     db: Session = Depends(get_db),
 ):
     doc = db.query(KnowledgeDocument).filter(KnowledgeDocument.id == doc_id).first()
@@ -190,7 +211,11 @@ def list_chunks(
 # ============================================================
 
 @router.post("/rag/search")
-def rag_search(body: SearchBody, db: Session = Depends(get_db)):
+def rag_search(
+    body: SearchBody,
+    user_id: int = Depends(current_user_id),
+    db: Session = Depends(get_db),
+):
     """检索知识库。返回分数明细，方便判断参数是否合理。"""
     result = retrieve(
         db=db,
@@ -206,11 +231,18 @@ def rag_search(body: SearchBody, db: Session = Depends(get_db)):
     # 正文只回前 500 字，避免调试接口的响应过大
     for hit in result["hits"]:
         hit["text"] = hit["text"][:500]
+        # 每条命中原本还带着完整的 1024 维向量（实测单条响应 14.5KB，
+        # 光向量就占绝大部分）。调试检索看的是分数明细，不是向量本身；
+        # 向量建没建好由同一响应里的 mode / embed_model 表达。
+        hit.pop("embedding", None)
     return result
 
 
 @router.get("/rag/stats")
-def rag_stats(db: Session = Depends(get_db)):
+def rag_stats(
+    user_id: int = Depends(current_user_id),
+    db: Session = Depends(get_db),
+):
     docs = db.query(KnowledgeDocument).all()
     chunks = db.query(DocumentChunk).count()
     with_vec = db.query(DocumentChunk).filter(DocumentChunk.embedding.isnot(None)).count()

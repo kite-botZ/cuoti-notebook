@@ -7,7 +7,7 @@ import time
 
 import jwt
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from app.db import get_db
@@ -55,7 +55,10 @@ def verify_password(password: str, hashed: str) -> bool:
         return False
 
 class RegisterBody(BaseModel):
-    username: str
+    # 50 = users.username 的真实宽度。不限制的话，60 字的用户名会一路走到
+    # INSERT，撞 MySQL 1406 Data too long → 裸 500（注册页直接白屏报错）。
+    # 这里提前挡住，返回 422 和一句人话。
+    username: str = Field(min_length=1, max_length=50)
     password: str
 
 class LoginBody(BaseModel):

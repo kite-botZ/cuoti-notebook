@@ -26,6 +26,11 @@ ENV/
 !frontend/.env.development
 backend/.env
 backend/.env.*
+# 这一行必须放在 `backend/.env.*` **后面**：git 取"最后一条匹配的规则"，
+# 而 `backend/.env.*` 会连 `backend/.env.example` 一起重新忽略掉上面的 `!.env.example`。
+# 现在它只是因为已经被 git 跟踪着才没出事——一旦有人 git rm --cached 再重新 add，
+# README 里那条 `cd backend && cp .env.example .env` 就会对全新克隆失效。
+!backend/.env.example
 frontend/.env.local
 frontend/.env.*.local
 *.key

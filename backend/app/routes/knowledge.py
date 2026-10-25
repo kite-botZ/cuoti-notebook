@@ -177,6 +177,22 @@ def set_question_kps(
     question = ensure_question_owned(question_id, user_id, db)
     bank_subject = _subject_of_question(db, question)
 
+    # 先把所有名字校验完，再动数据库。
+    #
+    # 历史缺陷：`apply_tags(..., replace=True)` 是"先覆盖后校验"——它会先把
+    # 这道题原有的关联删掉，然后对不合法的名字（空、"数学"这种过于宽泛的）
+    # 静默丢弃。于是传一个非法名字会得到 **200 + knowledge_points: []**，
+    # 用户原有的标注被清空、却没有任何报错，之后这道题的作答也不再更新任何
+    # 掌握度。而 POST /knowledge-points 对同一个名字是 422，两条路径口径不一致。
+    # 现在非法名字直接 422，且**原有标注一个都不动**。
+    for item in body.knowledge_points:
+        name = normalize_kp_name(item.name)
+        if not is_useful_kp(name):
+            raise HTTPException(
+                status_code=422,
+                detail=f"知识点名称太宽泛或为空：{item.name!r}",
+            )
+
     tags = [{"name": item.name, "weight": item.weight} for item in body.knowledge_points]
     apply_tags(db, question_id, tags, bank_subject, source="manual", replace=True)
     db.commit()
@@ -187,6 +203,24 @@ def _subject_of_question(db: Session, question: Question) -> str:
     from app.models import QuestionBank
     bank = db.query(QuestionBank).filter(QuestionBank.id == question.bank_id).first()
     return bank.subject if bank and bank.subject else "综合"
+
+
+def _tagged_question_count(db: Session, bank_id: int) -> int:
+    """题库里「已打标的题目数」——注意是题数，不是知识点关联条数。
+
+    历史 bug：auto-tag 曾直接对 QuestionKnowledgePoint 整行 `.distinct().count()`，
+    那是在数 qkp.id（一行 = 一条「题目↔知识点」关联），而打标提示词允许一题挂
+    1-3 个知识点，于是一道题被算成 2-3 道，`remaining` 因此偏小、甚至算成负数，
+    与 /knowledge-coverage 的 questions_untagged 口径不一致。
+    这里 select 的是 question_id 再 distinct，两个接口共用同一份口径，不会再各算各的。
+    """
+    return (
+        db.query(QuestionKnowledgePoint.question_id)
+        .join(Question, Question.id == QuestionKnowledgePoint.question_id)
+        .filter(Question.bank_id == bank_id, Question.is_archived.is_(False))
+        .distinct()
+        .count()
+    )
 
 
 # ============================================================
@@ -264,19 +298,14 @@ def auto_tag_bank(
     db.commit()
 
     report["subject"] = bank.subject
-    report["remaining"] = (
+    total = (
         db.query(Question)
         .filter(Question.bank_id == bank_id, Question.is_archived.is_(False))
         .count()
-        - db.query(QuestionKnowledgePoint)
-        .filter(
-            QuestionKnowledgePoint.question_id.in_(
-                select(Question.id).where(Question.bank_id == bank_id)
-            )
-        )
-        .distinct()
-        .count()
     )
+    # 口径必须和 /knowledge-coverage 的 questions_untagged 一致：数题目，不数关联条。
+    # 再 max(0, ...) 兜底，保证不会返回负数。
+    report["remaining"] = max(0, total - _tagged_question_count(db, bank_id))
     report["message"] = (
         f"标注完成：{report['tagged']}/{report['requested']} 道，"
         f"建立 {report['links']} 条知识点关联，"
@@ -302,13 +331,7 @@ def knowledge_coverage(
         .filter(Question.bank_id == bank_id, Question.is_archived.is_(False))
         .count()
     )
-    tagged_qids = (
-        db.query(QuestionKnowledgePoint.question_id)
-        .join(Question, Question.id == QuestionKnowledgePoint.question_id)
-        .filter(Question.bank_id == bank_id, Question.is_archived.is_(False))
-        .distinct()
-        .count()
-    )
+    tagged_qids = _tagged_question_count(db, bank_id)
     kp_count = (
         db.query(QuestionKnowledgePoint.kp_id)
         .join(Question, Question.id == QuestionKnowledgePoint.question_id)

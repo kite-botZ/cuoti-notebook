@@ -906,8 +906,18 @@ async function startAdaptive() {
   }
 }
 
+/**
+ * 请求代次：只有"最新一次请求"的结果才允许写进列表。
+ *
+ * 「加载更多」（追加）和「搜索 / 重取第一页」（替换）共用一个 questions 数组，
+ * 如果两个请求在飞的时候交错回来，旧查询的第 N 页会被追加到新搜索结果后面，
+ * 列表里就是两批不相干的题。递增 seq 在响应回来时比一次，过期的直接丢掉。
+ */
+let fetchSeq = 0
+
 /** 取某一页。`replace=true` 用于切换搜索词：从头开始，丢掉旧结果。 */
 async function fetchPage(target: number, replace: boolean) {
+  const seq = ++fetchSeq
   const params: Record<string, unknown> = { page: target, page_size: PAGE_SIZE }
   if (query.value) params.q = query.value
 
@@ -916,6 +926,9 @@ async function fetchPage(target: number, replace: boolean) {
   const { items, total, hasMore: more } = await getPage<Question[]>(
     `/banks/${bankId}/questions`, params
   )
+
+  // 期间又发起了更新的请求（改搜索词、删题重取）→ 这次的结果已经过期，丢弃
+  if (seq !== fetchSeq) return
 
   questions.value = replace ? items : [...questions.value, ...items]
   page.value = target
@@ -1043,12 +1056,45 @@ async function confirmDeleteQuestion(question: Question) {
   if (!confirmed) return
   try {
     await request.delete(`/questions/${question.id}`)
-    questions.value = questions.value.filter(q => q.id !== question.id)
+    // 删完必须**重取当前已加载的范围**，不能只在本地 splice。
+    //
+    // 后端是 offset 分页（offset = (page-1) * page_size）：本地删掉一条会让
+    // 已加载部分少一条，但服务端第 2 页仍然从"新顺序的第 51 条"开始，
+    // 于是原来第 50 条永远看不到，而界面上还显示"已显示 49 / 120"。
+    // 重取到当前页为止，页码和总数都跟着刷新。
+    await reloadLoadedPages()
     await Promise.all([loadStats(), loadBank()])
     toast.success('题目已删除')
   } catch (e: any) {
     toast.error(e.message || '删除失败')
   }
+}
+
+/**
+ * 重取"当前已经加载过的那几页"（不是只重取第 1 页）。
+ *
+ * 用户可能已经点过几次「加载更多」，只重取第 1 页会把后面几页都丢掉。
+ * 这里逐页取完再一次性写回，中间不产生闪烁；同时认领一个请求代次，
+ * 如果期间用户改了搜索词（或又删了一道题），这次的结果就过期、直接丢弃。
+ */
+async function reloadLoadedPages() {
+  const lastPage = page.value
+  const seq = ++fetchSeq
+  const collected: Question[] = []
+  let total = 0
+  let more = false
+  for (let p = 1; p <= lastPage; p++) {
+    const params: Record<string, unknown> = { page: p, page_size: PAGE_SIZE }
+    if (query.value) params.q = query.value
+    const res = await getPage<Question[]>(`/banks/${bankId}/questions`, params)
+    collected.push(...res.items)
+    total = res.total
+    more = res.hasMore
+  }
+  if (seq !== fetchSeq) return
+  questions.value = collected
+  matched.value = total
+  hasMore.value = more
 }
 
 // ==================== 新增 / 编辑弹窗 ====================
@@ -1125,19 +1171,10 @@ function removeKp(name: string) {
 }
 
 async function loadQuestionDetail(id: number): Promise<CutQuestion> {
-  // 从斩题列表（带答案的）里找
-  try {
-    const list = await request.get(
-      `/banks/${bankId}/questions?filter_type=cut`
-    ) as unknown as CutQuestion[]
-    const found = list.find(q => q.id === id)
-    if (found) return found
-  } catch { /* 忽略 */ }
-
-  // 找不到就从当前列表取（可能没有答案）
-  const q = questions.value.find(x => x.id === id)
-  if (!q) throw new Error('找不到题目')
-  return { ...q, correct_answer: '', explanation: '' }
+  // 取单题详情（这个接口带正确答案与解析）。
+  // 以前是从 filter_type=cut 的列表里翻一条——只有斩过的题才带答案，
+  // 没斩过的题拿不到答案与解析，保存时会把解析清空，所以改走这个接口。
+  return await request.get(`/questions/${id}`) as unknown as CutQuestion
 }
 
 function closeQuestionDialog() {

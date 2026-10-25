@@ -42,8 +42,14 @@ request.interceptors.response.use(
   // 失败：统一取出后端的错误信息
   // FastAPI 的错误在 err.response.data.detail 里
   (err) => {
-    const msg = err.response?.data?.detail || '请求失败'
-    return Promise.reject(new Error(msg))
+    const data = err.response?.data
+    // 有些接口失败时回的是**业务体**而不是 {detail}（比如讲义入库失败：
+    // 带 status / failed_stage / error 的完整 payload，只是状态码是 4xx）。
+    // 只认 detail 的话就会把它压成一句"请求失败"，具体原因全丢。
+    const msg = data?.detail || data?.message || '请求失败'
+    const error = new Error(msg) as Error & { data?: unknown }
+    error.data = data
+    return Promise.reject(error)
   }
 )
 

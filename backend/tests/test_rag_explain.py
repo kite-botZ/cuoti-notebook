@@ -96,8 +96,16 @@ def test_render_context_block_includes_rules():
     assert "不要整段照抄" in block
 
 
-def test_render_context_block_empty_when_no_context():
-    assert render_context_block("") == ""
+def test_render_context_block_no_context_still_forbids_fabricated_citations():
+    """空召回时也必须有规则——这正是最需要"不许编造出处"的场景。
+
+    旧行为是返回空串（连同规则一起消失），于是模型可以在没有任何来源的
+    情况下写出「教材里说……[1]」，而 sources 是空的、用户无法核对。
+    """
+    block = render_context_block("")
+    assert block != ""
+    assert "没有检索到" in block
+    assert "不要" in block and "编造引用" in block
 
 
 # ============================================================
@@ -242,8 +250,14 @@ def test_explain_without_docs_has_empty_sources(client, auth_headers, created_ba
     events = parse_sse(resp.text)
     sources = [e for e in events if "sources" in e][0]["sources"]
     assert sources == []
-    # 没有上下文时，prompt 里不应出现「教材参考片段」
-    assert "【教材参考片段】" not in fake.last_messages[0]["content"]
+    # 没有检索到片段时，prompt 里仍然要有「教材参考片段」这一段——只是里面
+    # 写明"本次没有检索到"，并在规则里禁止编造引用。
+    # 旧行为是整段消失，于是模型最可能瞎编"教材说……[1]"的场景下，
+    # 反编造规则恰好不在 prompt 里，而 sources 是空的、用户无从核对。
+    prompt = fake.last_messages[0]["content"]
+    assert "【教材参考片段】" in prompt
+    assert "没有检索到" in prompt
+    assert "编造引用" in prompt
 
 
 def test_explain_use_rag_false_skips_retrieval(client, auth_headers, created_bank, monkeypatch):
@@ -261,7 +275,10 @@ def test_explain_use_rag_false_skips_retrieval(client, auth_headers, created_ban
     source_events = [e for e in events if "sources" in e]
     assert source_events[0]["sources"] == []
     assert source_events[0]["rag_mode"] == "off"
-    assert "【教材参考片段】" not in fake.last_messages[0]["content"]
+    # 关掉 RAG 时也不该带上任何讲义片段正文
+    prompt = fake.last_messages[0]["content"]
+    assert "细节判断题" not in prompt  # _seed_doc 里的正文内容
+    assert "编造引用" in prompt        # 但反编造规则必须在
 
 
 def test_explain_survives_rag_failure(client, auth_headers, created_bank, monkeypatch):

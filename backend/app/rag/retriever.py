@@ -208,9 +208,18 @@ def hybrid_search(
 
 
 def mode_of(alpha: float, used_vector: bool) -> str:
-    """给调用方/日志用的检索模式标签。"""
+    """给调用方/日志用的检索模式标签。
+
+    alpha=1 纯向量、alpha=0 纯关键词（BM25）、中间是混合。
+    原先只判断 `alpha >= 1.0`，于是 alpha=0 被标成 "hybrid" ——
+    而这个字段的用处恰恰是让人看出"混合检索到底有没有比单路好"，
+    标错了就等于这个调试字段失效。
+    """
     if not used_vector:
         return "bm25"
     if alpha >= 1.0:
         return "vector"
+    if alpha <= 0.0:
+        # 有向量可用，但权重为 0：实际只用 BM25，标签如实写
+        return "bm25"
     return "hybrid"

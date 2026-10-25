@@ -154,7 +154,15 @@ def _normalize(item: dict) -> dict:
     qtype = str(
         item.get("question_type") or item.get("题型") or "single"
     ).strip().lower() or "single"
+    warnings: list[str] = []
     if qtype not in VALID_TYPES:
+        # 原先这里静默降级成单选，界面上零提示：用户写的"题型=essay"被当成
+        # 单选入库，"答案 A"的含义彻底变了却没人知道。手工加题走的是 422
+        # "不支持的题型"，两条路径对同一份数据必须给出一致的解释，
+        # 所以这里保留降级（不整条丢弃）但必须把它报出来。
+        warnings.append(
+            f"题型「{qtype}」不支持，已按单选处理（支持：{'/'.join(sorted(VALID_TYPES))}）"
+        )
         qtype = "single"
 
     options_raw = item.get("options") or item.get("选项") or []
@@ -189,7 +197,15 @@ def _normalize(item: dict) -> dict:
         "options": options,
         "correct_answer": correct_answer,
         "explanation": explanation,
+        # 私有键：由调用方转成 warning 级别的 ParseIssue 后立刻 pop 掉，
+        # 不会进入入库字段（入库用的是显式字段，见 insert 逻辑）。
+        "_warnings": warnings,
     }
+
+
+def _take_warnings(normalized: dict) -> list[str]:
+    """取走 `_normalize` 挂的警告，保证标准结构里只剩入库字段。"""
+    return normalized.pop("_warnings", [])
 
 
 def _parse_answer(raw, question_type: str, options_count: int) -> str:
@@ -285,14 +301,32 @@ def parse_json_report(content: bytes) -> ParseReport:
 
     report.total_rows = len(data)
     for i, item in enumerate(data, 1):
+        # 非对象元素必须先挡掉：`_normalize` 第一件事就是 `item.get("stem")`，
+        # 传进来的是字符串/数字就抛 AttributeError，而这里只捕获 ImportError
+        # → 整个文件 500，连一条错误清单都没有。可"逐行容错 + 结构化错误清单"
+        # 正是这个导入功能的主卖点：一个脏元素不该让另外 99 条好题也进不来。
+        if not isinstance(item, dict):
+            report.issues.append(ParseIssue(
+                location=f"第 {i} 条",
+                reason="每条题目必须是一个 JSON 对象，例如 {\"stem\": ...}",
+                raw=str(item)[:200],
+            ))
+            continue
         try:
-            report.questions.append(_normalize(item))
+            normalized = _normalize(item)
         except ImportError as e:
             report.issues.append(ParseIssue(
                 location=f"第 {i} 条",
                 reason=str(e),
-                raw=json.dumps(item, ensure_ascii=False) if isinstance(item, dict) else str(item),
+                raw=json.dumps(item, ensure_ascii=False),
             ))
+            continue
+        for reason in _take_warnings(normalized):
+            report.issues.append(ParseIssue(
+                location=f"第 {i} 条", reason=reason,
+                raw=json.dumps(item, ensure_ascii=False), severity="warning",
+            ))
+        report.questions.append(normalized)
     _dedupe(report)
     return report
 
@@ -402,19 +436,26 @@ def parse_excel_report(content: bytes) -> ParseReport:
             explanation = str(cell(col_explanation)).strip()
 
         try:
-            report.questions.append(_normalize({
+            normalized = _normalize({
                 "stem": stem,
                 "question_type": qtype or "single",
                 "options": options,
                 "correct_answer": answer_raw,
                 "explanation": explanation,
-            }))
+            })
         except ImportError as e:
             report.issues.append(ParseIssue(
                 location=f"第 {row_num} 行",
                 reason=str(e),
                 raw=stem,
             ))
+            continue
+        for reason in _take_warnings(normalized):
+            report.issues.append(ParseIssue(
+                location=f"第 {row_num} 行", reason=reason,
+                raw=stem, severity="warning",
+            ))
+        report.questions.append(normalized)
 
     if remapped_rows:
         report.issues.append(ParseIssue(
@@ -553,13 +594,20 @@ def _parse_text_report(text: str) -> ParseReport:
         q["question_type"] = qtype
 
         try:
-            report.questions.append(_normalize(q))
+            normalized = _normalize(q)
         except ImportError as e:
             report.issues.append(ParseIssue(
                 location=f"第 {i} 题",
                 reason=str(e),
                 raw=q.get("stem", ""),
             ))
+            continue
+        for reason in _take_warnings(normalized):
+            report.issues.append(ParseIssue(
+                location=f"第 {i} 题", reason=reason,
+                raw=q.get("stem", ""), severity="warning",
+            ))
+        report.questions.append(normalized)
 
     _dedupe(report)
     return report

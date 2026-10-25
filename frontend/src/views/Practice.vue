@@ -307,7 +307,7 @@
         </div>
 
         <div class="grid-actions">
-          <button class="ghost-button" type="button" @click="shuffleQuestions">打乱题序</button>
+          <button class="ghost-button" type="button" @click="shuffleAllQuestions">打乱题序</button>
           <button class="primary-button" type="button" @click="showGrid = false">继续答题</button>
         </div>
       </section>
@@ -634,15 +634,25 @@ function isCorrectOption(q: CutQuestion, index: number) {
  * 在本地 filter 只能筛出"当前页里符合条件的那些"，看起来像没生效。
  */
 function scopeParams(): Record<string, string | number | boolean> {
+  // 练习范围要排除「本人已斩题」。
+  // 斩题的定义就是"标记为已掌握、不再出现在练习里"（README 和题库页文案都这么写），
+  // 题库页的计数接口 /question-stats 与自适应选题也一直按这个口径算，
+  // 但列表接口以前没跟——于是「我的错题 12 道」点进去能刷出 14 道，
+  // 顺序练习也会刷到已经斩掉的题。这里统一回服务端过滤。
+  //
+  // 只有 source === 'cut'（专门复习斩题）这个入口不能加，否则它必然为空。
+  const noCut: Record<string, string | number | boolean> =
+    source === 'cut' ? {} : { exclude_cut: true }
+
   if (source === 'type' && qtypeFilter) {
     // 有图的题归入「看图题」，不再出现在原题型里——口径和题库页的分型统计一致
-    return { question_type: qtypeFilter, has_image: false }
+    return { question_type: qtypeFilter, has_image: false, ...noCut }
   }
-  if (source === 'image') return { has_image: true }
+  if (source === 'image') return { has_image: true, ...noCut }
   if (['wrong', 'favorite', 'cut', 'note'].includes(source)) {
-    return { filter_type: source }
+    return { filter_type: source, ...noCut }
   }
-  return {}
+  return noCut
 }
 
 /** 按 id 取题目正文，自动按 100 一批切分，并还原成传入的顺序。 */
@@ -815,9 +825,11 @@ async function loadQuestions() {
       totalCount.value = questions.value.length
       hasMore.value = false
     } else if (source === 'random') {
-      // 随机练习：先取整库 id（轻量）打乱，再分批取题目正文
+      // 随机练习：先取整库 id（轻量）打乱，再分批取题目正文。
+      // 过滤参数必须和后面分页取正文时**完全一致**（含 exclude_cut），
+      // 否则会出现"打乱时算进了斩题、取正文时又被过滤掉"的空洞。
       const res = await request.get(
-        `/banks/${bankId}/question-ids`
+        `/banks/${bankId}/question-ids`, { params: scopeParams() }
       ) as unknown as { ids: number[] }
       shuffledIds = [...(res.ids || [])]
       for (let i = shuffledIds.length - 1; i > 0; i--) {

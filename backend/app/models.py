@@ -41,7 +41,12 @@ class Question(Base):
     stem = Column(Text, nullable=False)
     question_type = Column(String(20), nullable=False, default="single")
     options = Column(JSON, nullable=False)
-    correct_answer = Column(String(50), nullable=False)
+    # 50 太窄了：简答/计算题的参考答案经常是一句话或一个算式，
+    # 超过 50 字就是常态（实测 60 字的算式直接撞 MySQL 1406 → 500，
+    # 建题失败且用户不知道该改什么）。放宽到 255，并在接口层加同样上限，
+    # 让"太长了"变成 422 的明确提示，而不是 500。
+    # ⚠️ 老库这一列还是 varchar(50)，要靠 scripts/upgrade_db.py 升级。
+    correct_answer = Column(String(255), nullable=False)
     explanation = Column(Text, nullable=False, default="")
     is_archived = Column(Boolean, nullable=False, default=False)
     created_at = Column(DateTime, server_default=func.now())
@@ -62,7 +67,13 @@ class AnswerAttempt(Base):
     # 修复：这里原本声明成 Integer，但写库时传的是 body.selected_answer（字符串，
     # 多选题是 "AB" 这种）。SQLite 是弱类型所以测试全绿，MySQL 严格模式下
     # 会直接报 1366 Incorrect integer value —— 属于被测试环境掩盖的线上必崩缺陷。
-    selected_answer = Column(String(255), nullable=False)
+    #
+    # 长度 500 是**以真实库为准**（线上/本地都是 varchar(500)）：这里曾经声明成
+    # String(255)，和库不一致。声明比库短本身不报错，但接口层不做长度校验时，
+    # 一个 501 字的答案会直接撞 MySQL 1406 → 500，并且把这次作答整个回滚掉
+    # （判分结果、答题历史、掌握度更新全丢）。所以这里对齐真实宽度，
+    # 同时在接口层加上同样的上限（见 routes/banks.py 的 AnswerCreate）。
+    selected_answer = Column(String(500), nullable=False)
     is_correct = Column(Boolean, nullable=False)
     answered_at = Column(DateTime, server_default=func.now(), nullable=False)
 

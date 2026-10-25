@@ -93,6 +93,27 @@ def _split_paragraphs(page_text: str) -> list[str]:
     return blocks
 
 
+def _heading_of(block: str) -> str | None:
+    """从一段文本里找出标题行，找不到返回 None。
+
+    为什么不能直接 `is_heading(block)`：
+
+    讲义 / Word / Markdown 最常见的排法是**空行分段**，于是一个 block 往往是
+    「一、中心理解题\\n总原则：先看问题……」这种"标题 + 整段正文"的多行文本。
+    `is_heading` 看的是整段，多行必然判 False，结果 chapters 一直是空的，
+    全文 chapter 都落到兜底的「正文」上——章节元数据整条链路形同没有。
+
+    所以这里退一步看 block 的**首行**：首行像标题、且 block 确实不止一行时，
+    就认它是标题（block 本身仍然整段进正文，标题不会丢）。
+    """
+    if is_heading(block):
+        return block
+    first_line, sep, _rest = block.partition("\n")
+    if sep and is_heading(first_line.strip()):
+        return first_line.strip()
+    return None
+
+
 def chunk_pages(
     pages: list[Page],
     target: int = DEFAULT_TARGET,
@@ -132,21 +153,41 @@ def chunk_pages(
             last_page = page.page_no
 
         for block in _split_paragraphs(text):
-            if is_heading(block):
-                # 标题既更新章节路径，**也要保留在正文里**。
+            heading = _heading_of(block)
+            if heading is not None:
+                # 标题既更新章节，**也要保留在正文里**。
                 #
                 # 这一点踩过坑：最初标题只写进 chapter 元数据、不进 chunk 正文，
                 # 结果像「十、细节判断题」这种只出现在标题里的说法，正文里
                 # 一个字都没有，用户搜「细节判断题」永远命中不了。
                 # 标题是最强的检索信号，必须让它进正文。
-                if len(chapters) >= 3:
-                    chapters.pop(0)
-                chapters.append(block[:60])
+                #
+                # 这里**只记当前所在小节**，不再拼多层路径（原来是"取最近 3 个
+                # 标题 join"）。原因是块级标题分不出"父子"还是"兄弟"，拼出来
+                # 的层级是编的：拿一份真实简历 PDF 实测，同级的
+                # 「教育经历 / 专业技能 / 项目经历」被拼成了
+                # 「专业技能 > 项目经历 > Compose」这种假层级，
+                # 出处反而比只给一个准确的小节名更不可信。
+                # 与其编一个推不出来的层级，不如老实给当前小节。
+                chapters = [heading[:60]]
+
+                # 换章节时先把累积的内容收尾。
+                #
+                # 原先只在「buf 为空」时才写 buf_chapter，而默认 overlap=80
+                # 时 flush() 之后 buf 永远不空（:122 会把尾巴留下），于是
+                # buf_chapter 在第一个标题之后就**再也不会更新**：整份讲义的
+                # 每个片段都标着第一章的标题。表现为"引用出处张冠李戴"——
+                # 用户看到的 chapter 和片段正文对不上，而这个字段正是
+                # README 承诺的"保留章节/页码"。
+                if buf.strip():
+                    flush()
 
             if not buf:
                 buf_page = page.page_no
                 buf_chapter = " > ".join(chapters)
-            elif not buf_chapter:
+            else:
+                # 走到这里说明还在同一章节内；若章节路径变了（上面刚 flush 过
+                # 的情况除外），也要跟上，避免片段挂着过期章节。
                 buf_chapter = " > ".join(chapters)
 
             buf = (buf + "\n" + block) if buf else block
@@ -170,8 +211,11 @@ def chunk_pages(
     if buf.strip():
         text = buf.strip()
         if text:
+            # 和 flush() 用同一套兜底：buf_page 可能因重叠被重置成 None，
+            # 那样最后一个片段会丢页码（单页文档实测 page=None）。
             chunks.append(Chunk(text=text, chapter=buf_chapter,
-                                page=buf_page, index=len(chunks)))
+                                page=buf_page if buf_page is not None else last_page,
+                                index=len(chunks)))
 
     # 合并过短的尾片段，避免出现「半句话」的 chunk
     merged: list[Chunk] = []

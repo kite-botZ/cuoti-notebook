@@ -544,7 +544,8 @@ python scripts/smoke_knowledge_api.py --base-url http://127.0.0.1:3000
 <summary><b>上传图片或导入大文件失败</b></summary>
 
 Nginx 默认只允许 1MB 请求体。本项目 `frontend/nginx.conf` 里已经设了
-`client_max_body_size 20m`（图片限制 5MB、导入限制 10MB）。
+`client_max_body_size 50m`（讲义上传上限 30MB，所以 Nginx 要略大于它；
+图片限制 5MB、导入限制 10MB）。
 如果你用的是自己的 Nginx，记得同步这个配置。
 </details>
 
@@ -557,7 +558,7 @@ Nginx 默认只允许 1MB 请求体。本项目 `frontend/nginx.conf` 里已经�
 2. 或者进 `/knowledge` 页面批量打标。
 
 题目一个知识点都没有时，自适应选题会退化成"按题号顺序出没做过的题"
-（接口里明确返回 `strategy=fallback_no_kp`），不会假装在诊断。
+（接口里明确返回 `strategy=no_kp_fallback`），不会假装在诊断。
 另外跑批用的是本地模型，**1 批 10 题约 20 秒，2 万题全量约 12 小时**，
 先用 `TAG_BATCH_SIZE` 或页面上的数量上限小范围试。
 </details>

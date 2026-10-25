@@ -500,7 +500,14 @@ async function submitUpload() {
     }
   } catch (e: any) {
     uploadOk.value = false
-    uploadMessage.value = e.message || '上传失败'
+    // 入库失败现在回 422（以前错误地回 201），body 还是那份带 status/error 的
+    // 业务体，拦截器把它挂在 e.data 上。这里优先用里面的原因，
+    // 否则用户只会看到一句笼统的"请求失败"，而真正的原因（扫描件 / 太短）
+    // 本来就写在 error 字段里。
+    const body = e?.data
+    uploadMessage.value = (body && typeof body === 'object' && body.status
+      ? body.message || body.error
+      : e.message) || '上传失败'
     toast.error(uploadMessage.value)
   } finally {
     uploading.value = false

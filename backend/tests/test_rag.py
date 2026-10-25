@@ -403,12 +403,12 @@ def test_list_and_delete_document(client, auth_headers, monkeypatch):
         data={"subject": "行测"}, headers=auth_headers,
     ).json()
 
-    listed = client.get("/api/knowledge-docs").json()
+    listed = client.get("/api/knowledge-docs", headers=auth_headers).json()
     assert any(d["id"] == doc["id"] for d in listed)
 
     assert client.delete(f"/api/knowledge-docs/{doc['id']}",
                          headers=auth_headers).status_code == 200
-    assert client.get("/api/knowledge-docs").json() == []
+    assert client.get("/api/knowledge-docs", headers=auth_headers).json() == []
 
 
 def test_chunks_endpoint(client, auth_headers, monkeypatch):
@@ -419,7 +419,8 @@ def test_chunks_endpoint(client, auth_headers, monkeypatch):
         data={"subject": "行测"}, headers=auth_headers,
     ).json()
 
-    resp = client.get(f"/api/knowledge-docs/{doc['id']}/chunks?limit=2")
+    resp = client.get(f"/api/knowledge-docs/{doc['id']}/chunks?limit=2",
+                      headers=auth_headers)
     assert resp.status_code == 200
     body = resp.json()
     assert len(body["chunks"]) <= 2
@@ -434,12 +435,15 @@ def test_rag_search_endpoint(client, auth_headers, monkeypatch):
         data={"subject": "行测"}, headers=auth_headers,
     )
     resp = client.post("/api/rag/search",
-                       json={"query": "细节判断 偷换概念", "top_k": 3})
+                       json={"query": "细节判断 偷换概念", "top_k": 3},
+                       headers=auth_headers)
     assert resp.status_code == 200
     body = resp.json()
     assert body["hits"]
     assert "bm25_score" in body["hits"][0]
     assert "vector_score" in body["hits"][0]
+    # 命中里不该再带完整向量（1024 维 JSON，单条响应会膨胀到十几 KB）
+    assert "embedding" not in body["hits"][0]
 
 
 def test_rag_stats_endpoint(client, auth_headers, monkeypatch):
@@ -449,7 +453,67 @@ def test_rag_stats_endpoint(client, auth_headers, monkeypatch):
         files={"file": ("a.md", SAMPLE.encode(), "text/markdown")},
         data={"subject": "行测"}, headers=auth_headers,
     )
-    stats = client.get("/api/rag/stats").json()
+    stats = client.get("/api/rag/stats", headers=auth_headers).json()
     assert stats["documents"] == 1
     assert stats["chunks"] > 0
     assert stats["embedding_coverage"] == 0.0     # 本次没有向量，降级为 BM25
+
+
+# ============================================================
+# 5. 讲义的鉴权与归属
+# ============================================================
+#
+# 这一组用例是补上的：原先讲义相关的 5 个接口里，4 个连 token 都不需要，
+# 删除接口收了 user_id 却从不使用。实测结果是**任何登录用户（甚至匿名）
+# 都能读到别人上传的讲义全文，并能把它删掉**。改完必须有测试钉住，
+# 否则这类"越权"很容易在后续重构里再漏回去。
+
+def test_reading_docs_requires_login(client):
+    """没有 token 时，讲义的读接口一律 401（不能匿名读到别人的材料）。"""
+    assert client.get("/api/knowledge-docs").status_code == 401
+    assert client.get("/api/knowledge-docs/1/chunks").status_code == 401
+    assert client.get("/api/rag/stats").status_code == 401
+    assert client.post("/api/rag/search",
+                       json={"query": "随便", "top_k": 3}).status_code == 401
+
+
+def test_delete_other_users_document_is_404(client, auth_headers, monkeypatch):
+    """删别人的讲义必须是 404，并且那份讲义要真的还在。"""
+    monkeypatch.setattr("app.rag.service.get_embedder", lambda *a, **k: None)
+    doc = client.post(
+        "/api/knowledge-docs",
+        files={"file": ("a.md", SAMPLE.encode(), "text/markdown")},
+        data={"subject": "行测"}, headers=auth_headers,
+    ).json()
+
+    other = client.post("/api/register",
+                        json={"username": "docintruder", "password": "Abcd1234"})
+    assert other.status_code == 201
+    other_headers = {
+        "Authorization": "Bearer " + client.post(
+            "/api/login",
+            json={"username": "docintruder", "password": "Abcd1234"},
+        ).json()["token"]
+    }
+
+    # 越权删除按 404 处理（和题库侧口径一致：不暴露"这个 id 存在"）
+    assert client.delete(f"/api/knowledge-docs/{doc['id']}",
+                         headers=other_headers).status_code == 404
+    # 关键断言：原主人的讲义没被删掉
+    assert client.get(f"/api/knowledge-docs/{doc['id']}/chunks",
+                      headers=auth_headers).status_code == 200
+    listed = client.get("/api/knowledge-docs", headers=auth_headers).json()
+    assert any(d["id"] == doc["id"] for d in listed)
+
+
+def test_doc_payload_marks_ownership(client, auth_headers, monkeypatch):
+    """列表要回传归属，前端才不会给别人的讲义显示删除按钮。"""
+    monkeypatch.setattr("app.rag.service.get_embedder", lambda *a, **k: None)
+    client.post(
+        "/api/knowledge-docs",
+        files={"file": ("a.md", SAMPLE.encode(), "text/markdown")},
+        data={"subject": "行测"}, headers=auth_headers,
+    )
+    mine = client.get("/api/knowledge-docs", headers=auth_headers).json()
+    assert mine[0]["can_delete"] is True
+    assert mine[0]["uploaded_by"] is not None
