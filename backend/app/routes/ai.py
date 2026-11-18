@@ -280,7 +280,14 @@ async def ai_explain(
     # 于是每个请求都会掉进下面的等待分支，白等 CACHE_WAIT_TIMEOUT（120 秒）才生成。
     # 实测这个分支会让"没装 Redis"的环境下每次 AI 解析都卡两分钟。
     lock_name = f"explain:{question.id}:{h}"
-    if cache.enabled and not cache.acquire_lock(lock_name, ttl=LOCK_TTL):
+    # lock_owner 非 None 表示「锁是我们抢到的」，只有这种情况才有资格释放。
+    # 修复前的 bug：等待超时的那条路径也会走到 finally 里的 release_lock，
+    # 把**持锁方**的锁删掉 —— 持锁方还在慢慢生成，锁却没了，
+    # 后续请求全部涌进来各自回源，防击穿窗口被重新打开。
+    lock_owner: str | None = None
+    if cache.enabled:
+        lock_owner = cache.acquire_lock(lock_name, ttl=LOCK_TTL)
+    if cache.enabled and lock_owner is None:
         # 关键：等待必须扔到线程池里等。
         # cache.wait_for 内部是 time.sleep 轮询（同步阻塞），
         # 如果直接在 async 函数里调用，会把整个事件循环卡住几十秒——
@@ -293,7 +300,9 @@ async def ai_explain(
                 media_type="text/event-stream",
             )
         # 等到超时还没回填（持锁方挂了）：自己生成，但不抢锁、不回填，
-        # 避免和持锁方重复写缓存
+        # 避免和持锁方重复写缓存。注意此时 lock_owner 仍是 None，
+        # finally 里不会去删别人的锁。
+
 
     # ---------- 3. 回源：调本地模型 ----------
     # 修复：v1 里 context 用 include_answer=True 算出来了，但 system_prompt
@@ -356,7 +365,9 @@ async def ai_explain(
         except Exception as e:
             yield _sse({"error": str(e)})
         finally:
-            cache.release_lock(lock_name)
+            # 只释放自己持有的锁；没抢到锁的请求（lock_owner is None）什么都不做
+            if lock_owner is not None:
+                cache.release_lock(lock_name, lock_owner)
 
     return StreamingResponse(stream_and_fill(), media_type="text/event-stream")
 

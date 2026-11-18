@@ -104,7 +104,7 @@ async function sendMessage() {
       }),
     })
 
-    if (!res.ok) throw new Error('AI 请求失败')
+    if (!res.ok) throw new Error(`AI 请求失败（HTTP ${res.status}）`)
 
     const reader = res.body?.getReader()
     if (!reader) throw new Error('无法读取流')
@@ -132,11 +132,19 @@ async function sendMessage() {
             continue
           }
 
-          // 后端返回错误时，把错误抛到外层 catch
-          if (parsed.error) {
-            throw new Error(parsed.error)
+          // /api/ai/chat 的帧是「带 type 的事件」（见 app/agent/react.py）：
+          //   {type:'text', content} / {type:'tool_call'} / {type:'tool_result'}
+          //   {type:'error', content} / {type:'done'}
+          // 修复前这里只判 parsed.error，而错误帧是 {type:'error', content:'模型调用失败：...'}，
+          // 于是错误被当成正常正文渲染成 AI 的回答。
+          if (parsed.type === 'error' || parsed.error) {
+            throw new Error(String(parsed.error ?? parsed.content ?? 'AI 服务出错'))
           }
-          if (parsed.content) {
+          // 工具调用的中间事件暂不渲染（后续要做结构化展示再说），但也不能当正文
+          if (parsed.type === 'tool_call' || parsed.type === 'tool_result' || parsed.type === 'done') {
+            continue
+          }
+          if (typeof parsed.content === 'string' && (parsed.type === 'text' || parsed.type === undefined)) {
             streamingText.value += parsed.content
           }
         }
@@ -147,6 +155,12 @@ async function sendMessage() {
     messages.value.push({ role: 'assistant', content: streamingText.value })
     streamingText.value = ''
     } catch (e: any) {
+    // 已经流下来的半截内容先落成一条消息：错误发生在中途时，
+    // 之前收到的文字是有效信息，不该跟着一起丢掉
+    if (streamingText.value.trim()) {
+      messages.value.push({ role: 'assistant', content: streamingText.value })
+      streamingText.value = ''
+    }
     const msg = e?.message || 'AI 服务暂时不可用'
     messages.value.push({
       role: 'assistant',

@@ -24,6 +24,7 @@ import json
 import os
 import random
 import time
+import uuid
 from typing import Any, Callable
 
 try:  # 没装 redis-py 时整体降级，不影响服务启动
@@ -153,13 +154,43 @@ class Cache:
 
     # ---------------------------------------------------------- 防击穿
 
-    def acquire_lock(self, name: str, ttl: int = 60) -> bool:
-        """`SET NX EX` 抢锁；抢到的人负责回源并回填缓存。"""
-        key = f"{PREFIX}:lock:{name}"
-        return bool(self._safe(lambda: self._client.set(key, "1", nx=True, ex=ttl)))
+    # 只删「自己持有的」锁：值必须仍然是自己的 owner token。
+    # 用 Lua 保证 GET 和 DEL 在 Redis 端是原子的，避免这个经典竞态：
+    #   A 的锁过期 → B 抢到锁 → A 醒来 DEL，把 B 的锁删了 → 防击穿失效。
+    _RELEASE_LOCK_SCRIPT = """
+if redis.call('get', KEYS[1]) == ARGV[1] then
+    return redis.call('del', KEYS[1])
+else
+    return 0
+end
+"""
 
-    def release_lock(self, name: str) -> None:
-        self._safe(lambda: self._client.delete(f"{PREFIX}:lock:{name}"))
+    def acquire_lock(self, name: str, ttl: int = 60) -> str | None:
+        """`SET NX EX` 抢锁，抢到返回**自己的 owner token**，没抢到返回 None。
+
+        返回 token（而不是 bool）是为了让 `release_lock` 能校验归属：
+        调用方必须把 token 原样带回，否则删别人的锁。
+        """
+        key = f"{PREFIX}:lock:{name}"
+        owner = uuid.uuid4().hex
+        ok = self._safe(lambda: self._client.set(key, owner, nx=True, ex=ttl))
+        return owner if ok else None
+
+    def release_lock(self, name: str, owner: str | None = None) -> bool:
+        """释放锁。
+
+        - 传 `owner`：只有锁的值还是这个 token 才删（正常路径，推荐）
+        - 不传：退化成「值等于旧格式标记 `1` 才删」，兼容早期版本留下的锁；
+          此时**不会**误删别人用 token 持有的锁
+        """
+        key = f"{PREFIX}:lock:{name}"
+        expected = owner if owner is not None else "1"
+        return bool(
+            self._safe(
+                lambda: self._client.eval(self._RELEASE_LOCK_SCRIPT, 1, key, expected)
+            )
+        )
+
 
     def wait_for(self, key: str, timeout: float = 30.0, interval: float = 0.05) -> Any | None:
         """等别人回填缓存（防击穿里「没抢到锁」的分支）。"""
