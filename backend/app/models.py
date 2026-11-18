@@ -11,6 +11,10 @@ class User(Base):
     id = Column(BigInteger().with_variant(Integer, "sqlite"), primary_key=True, autoincrement=True)
     username = Column(String(50), unique=True, nullable=False, index=True)
     password = Column(String(255), nullable=False)  # 演示用明文；生产要哈希
+    # 已签发 token 的版本号。改密码 / 重置密码时 +1，
+    # 于是所有旧 token 立刻失效（签发时把当前值写进 payload 的 tv 声明）。
+    # 老库需要 `python scripts/upgrade_db.py --apply` 补这一列。
+    token_version = Column(Integer, nullable=False, default=1, server_default="1")
     created_at = Column(DateTime, server_default=func.now())
 
 

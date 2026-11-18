@@ -1,15 +1,22 @@
+# 注意：docker-compose 的 backend 用 `context: ./backend`（本目录就是后端根），
+# 所以这里的路径都相对 backend/，只需要排除后端自己的垃圾文件。
+
 __pycache__/
 *.py[cod]
 *.egg-info/
 .pytest_cache/
 .mypy_cache/
+.ruff_cache/
 
 venv/
 .venv/
+.venv312/
 env/
 
+# 本地密钥：镜像里绝不能有 .env（compose 通过 environment 注入）
 .env
 
+# 上传的图片是运行时数据，由 volume 挂载，不进镜像
 uploads/
 
 *.log
@@ -19,3 +26,4 @@ uploads/
 .gitignore
 .idea/
 .vscode/
+.DS_Store

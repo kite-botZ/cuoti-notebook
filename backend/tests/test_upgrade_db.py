@@ -86,3 +86,60 @@ def test_unique_constraint_is_not_reported_as_missing_index(sqlite_engine):
     assert "uq_user_kp_mastery" not in missing_names
     assert not any("username" in n for n in missing_names), \
         f"把唯一约束当成缺索引了：{missing_names}"
+
+
+# ============================================================
+# 缺列检查（token_version 这类"新加的列"）
+# ============================================================
+
+def test_fresh_database_has_no_missing_columns(sqlite_engine):
+    """新建的库列是齐的，不该报缺。"""
+    assert upgrade_db.missing_columns(inspect(sqlite_engine)) == []
+
+
+def test_declares_token_version_column():
+    """`users.token_version` 是吊销 token 的依据，必须在声明列里。
+
+    这条用例的真正用途：如果以后有人把这一列删了/改名了，
+    `decode_token` 会全线 401，而错误信息不会指向这里。
+    """
+    columns = upgrade_db.declared_columns()["users"]
+    assert "token_version" in columns
+    # 老库补列时不能留 NULL（NOT NULL 且带默认值 1）
+    column = columns["token_version"]
+    assert column.nullable is False
+    assert "1" in str(column.server_default.arg)
+
+
+def test_detects_a_dropped_column(sqlite_engine):
+    """老库少一列必须能认出来，且 DDL 片段要能直接拼进 ALTER TABLE。
+
+    这是"缺列"比"缺索引"严重的地方：缺索引只是慢，缺列是接口直接 500
+    （`Unknown column 'users.token_version' in 'field list'`）。
+    """
+    with sqlite_engine.begin() as conn:
+        conn.execute(text("ALTER TABLE users DROP COLUMN token_version"))
+
+    missing = upgrade_db.missing_columns(inspect(sqlite_engine))
+    assert len(missing) == 1, missing
+    table, name, ddl = missing[0]
+    assert (table, name) == ("users", "token_version")
+    assert "INTEGER" in ddl.upper()
+    assert "NOT NULL" in ddl.upper()
+    assert "DEFAULT 1" in ddl.upper()
+
+
+def test_missing_columns_skips_unknown_tables():
+    """库里没有的表由 `create_all` 负责整表新建，不算"缺列"。
+
+    否则全新库第一次跑脚本时，会被"12 张表、几十个列全缺"的噪音淹没。
+    """
+
+    class _Inspector:
+        def get_table_names(self):
+            return []
+
+        def get_columns(self, table):  # pragma: no cover - 不该被调用
+            raise AssertionError(f"不该对缺失的表查列：{table}")
+
+    assert upgrade_db.missing_columns(_Inspector()) == []

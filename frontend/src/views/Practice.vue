@@ -231,6 +231,52 @@
                 class="ai-explain-content"
                 v-html="renderMarkdown(aiExplanation)"
               ></div>
+
+              <!-- 讲解依据：讲义片段。后端每帧都会先推 sources，这里把它显示出来，
+                   让"AI 这么说"变成"讲义第 3 章第 27 页这么说"。 -->
+              <div
+                v-if="aiSources.length || aiRagModeHint"
+                class="ai-sources"
+              >
+                <div class="ai-sources-head" @click="aiSourcesOpen = !aiSourcesOpen">
+                  <span class="ai-sources-title">
+                    讲解依据
+                    <span v-if="aiSources.length" class="ai-sources-count">
+                      {{ aiSources.length }} 段
+                    </span>
+                  </span>
+                  <span class="ai-rag-badge" :class="`is-${aiRagMode || 'none'}`">
+                    {{ aiRagModeHint }}
+                  </span>
+                  <span v-if="aiCached" class="ai-cached-badge">缓存</span>
+                  <span v-if="aiSources.length" class="ai-sources-toggle">
+                    {{ aiSourcesOpen ? '收起' : '展开' }}
+                  </span>
+                </div>
+
+                <ol v-if="aiSourcesOpen && aiSources.length" class="ai-sources-list">
+                  <li
+                    v-for="(s, i) in aiSources"
+                    :key="s.chunk_id ?? `${s.index}-${i}`"
+                    class="ai-source-item"
+                  >
+                    <div class="ai-source-line">
+                      <span class="ai-source-index">[{{ s.index ?? i + 1 }}]</span>
+                      <span class="ai-source-title">《{{ s.title || '未命名讲义' }}》</span>
+                      <span v-if="s.chapter" class="ai-source-meta">{{ s.chapter }}</span>
+                      <span v-if="s.page" class="ai-source-meta">第 {{ s.page }} 页</span>
+                      <span v-if="typeof s.score === 'number'" class="ai-source-meta">
+                        相关度 {{ s.score.toFixed(3) }}
+                      </span>
+                    </div>
+                    <p v-if="s.preview" class="ai-source-preview">{{ s.preview }}</p>
+                  </li>
+                </ol>
+
+                <p v-else-if="aiSourcesOpen" class="ai-sources-empty">
+                  讲义库里没有匹配到相关内容，下面的讲解没有引用教材原文。
+                </p>
+              </div>
             </div>
           </section>
         </article>
@@ -555,6 +601,46 @@ const adaptiveLoading = ref(false)
 // AI 解析
 const aiExplaining = ref(false)
 const aiExplanation = ref('')
+
+// RAG 检索依据（后端 SSE 的第一帧就是 sources + rag_mode）。
+// 之前这里完全没有接：后端算出了引用编号、讲义标题、章节、页码，
+// 前端一个字段都没显示，等于让 AI 讲解"无出处自证"。
+interface AiSource {
+  index?: number
+  chunk_id?: number
+  doc_id?: number
+  title?: string
+  chapter?: string
+  page?: number
+  score?: number
+  coverage?: number
+  preview?: string
+}
+const aiSources = ref<AiSource[]>([])
+const aiSourcesOpen = ref(false)
+const aiRagMode = ref('')
+const aiCached = ref(false)
+
+// rag_mode 的取值来自 app/rag/retriever.py 的 mode_of()：
+// hybrid / vector / bm25，外加 service 层的 none 和路由层的 off / error。
+const aiRagModeHint = computed(() => {
+  switch (aiRagMode.value) {
+    case 'hybrid':
+      return '混合检索'
+    case 'vector':
+      return '仅向量'
+    case 'bm25':
+      return '仅关键词'
+    case 'none':
+      return '未命中讲义'
+    case 'error':
+      return '检索失败'
+    case 'off':
+      return '未启用检索'
+    default:
+      return ''
+  }
+})
 
 const currentQuestion = computed(() => questions.value[currentIndex.value])
 const currentAnswer = computed(() => {
@@ -1308,6 +1394,9 @@ async function requestAiExplain() {
   if (!currentQuestion.value || aiExplaining.value) return
   aiExplaining.value = true
   aiExplanation.value = ''
+  aiSources.value = []
+  aiRagMode.value = ''
+  aiCached.value = false
 
   try {
     const token = localStorage.getItem('token')
@@ -1323,7 +1412,12 @@ async function requestAiExplain() {
       }),
     })
 
-    if (!res.ok) throw new Error('AI 请求失败')
+    if (!res.ok) {
+      // 401 是 token 过期（改密码后也会立刻变成 401，因为服务端会吊销旧 token），
+      // 单独给一句话，别让用户以为"AI 挂了"。
+      if (res.status === 401) throw new Error('登录已失效，请重新登录后再试')
+      throw new Error(`AI 请求失败（HTTP ${res.status}）`)
+    }
 
     const reader = res.body?.getReader()
     if (!reader) throw new Error('无法读取流')
@@ -1337,19 +1431,36 @@ async function requestAiExplain() {
       const lines = buffer.split('\n\n')
       buffer = lines.pop() || ''
       for (const line of lines) {
-        if (line.startsWith('data: ')) {
-          const data = line.slice(6)
-          if (data === '[DONE]') continue
-          try {
-            const parsed = JSON.parse(data)
-            if (parsed.error) throw new Error(parsed.error)
-            if (parsed.content) aiExplanation.value += parsed.content
-          } catch { /* 忽略 */ }
+        if (!line.startsWith('data: ')) continue
+        const data = line.slice(6)
+        if (data === '[DONE]') continue
+
+        // 这里只吞"不是 JSON"的帧（比如心跳/空行），
+        // 业务错误必须冒到外层 catch —— 原先把 `throw new Error(parsed.error)`
+        // 也包在同一个 try 里，异常被自己的 catch 吃掉，
+        // 于是模型报错时页面表现为"解析永远空白"。
+        let parsed: any
+        try {
+          parsed = JSON.parse(data)
+        } catch {
+          continue
         }
+
+        if (parsed.error) throw new Error(String(parsed.error))
+
+        // 第一帧：sources + rag_mode（缓存回放时也会有）
+        if (parsed.sources !== undefined) {
+          aiSources.value = Array.isArray(parsed.sources) ? parsed.sources : []
+          aiRagMode.value = parsed.rag_mode || ''
+          // 有依据就默认展开：用户点 AI 解析就是想看依据
+          aiSourcesOpen.value = aiSources.value.length > 0
+        }
+        if (parsed.cached) aiCached.value = true
+        if (parsed.content) aiExplanation.value += parsed.content
       }
     }
-  } catch (e) {
-    aiExplanation.value = 'AI 解析加载失败，请检查 Ollama 是否正在运行。'
+  } catch (e: any) {
+    aiExplanation.value = `AI 解析加载失败：${e?.message || '请检查 Ollama 是否正在运行'}`
   } finally {
     aiExplaining.value = false
   }
@@ -2108,6 +2219,119 @@ function backToBank() {
   font-size: 14px;
   line-height: 1.75;
   word-break: break-word;
+}
+
+/* ---------- 讲解依据（RAG sources）---------- */
+.ai-sources {
+  margin-top: 10px;
+  border: 1px solid #dbe7e0;
+  border-radius: 10px;
+  background: rgba(250, 253, 251, .9);
+  overflow: hidden;
+}
+.ai-sources-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 12px;
+  cursor: pointer;
+  user-select: none;
+  font-size: 13px;
+  color: #3c5a4b;
+}
+.ai-sources-head:hover {
+  background: #f0f7f3;
+}
+.ai-sources-title {
+  font-weight: 600;
+}
+.ai-sources-count {
+  margin-left: 4px;
+  font-weight: 400;
+  color: #7a8f84;
+}
+.ai-sources-toggle {
+  margin-left: auto;
+  color: #8aa093;
+  font-size: 12px;
+}
+.ai-rag-badge {
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: #eef4f0;
+  color: #55705f;
+  font-size: 11px;
+}
+/* 检索质量一眼可见：命中/未命中/失败用不同底色 */
+.ai-rag-badge.is-hybrid,
+.ai-rag-badge.is-vector,
+.ai-rag-badge.is-bm25 {
+  background: #e3f3e9;
+  color: #2f7a52;
+}
+.ai-rag-badge.is-none,
+.ai-rag-badge.is-off {
+  background: #f3f1e6;
+  color: #8a7c34;
+}
+.ai-rag-badge.is-error {
+  background: #fbe9e7;
+  color: #b3402f;
+}
+.ai-cached-badge {
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: #eef1f8;
+  color: #5a6b8a;
+  font-size: 11px;
+}
+.ai-sources-list {
+  margin: 0;
+  padding: 0 12px 10px 12px;
+  list-style: none;
+  max-height: 320px;
+  overflow-y: auto;
+}
+.ai-source-item {
+  padding: 8px 0;
+  border-top: 1px dashed #e2ebe6;
+  font-size: 13px;
+  line-height: 1.6;
+}
+.ai-source-line {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: baseline;
+}
+.ai-source-index {
+  color: #2f7a52;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+.ai-source-title {
+  color: #2d4238;
+  font-weight: 500;
+}
+.ai-source-meta {
+  color: #80958a;
+  font-size: 12px;
+}
+.ai-source-preview {
+  margin: 4px 0 0;
+  color: #6b7f74;
+  font-size: 12px;
+  line-height: 1.6;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.ai-sources-empty {
+  margin: 0;
+  padding: 0 12px 12px;
+  color: #8a9b91;
+  font-size: 12px;
 }
 
 .practice-footer {

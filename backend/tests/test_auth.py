@@ -59,23 +59,30 @@ def test_login_success(client, registered_user):
 
 
 def test_login_wrong_password(client, registered_user):
-    """密码错误：返回 400。"""
+    """密码错误：返回 400，且文案与"用户不存在"完全一致。
+
+    两个分支必须是同一句话：原来分别回「账号不存在」和「密码错误」，
+    于是注册页 + 找回密码页就能把库里的用户名枚举出来，
+    给撞库提供免费的用户名清单（`test_login_user_not_exist` 里反向断言）。
+    """
     resp = client.post("/api/login", json={
         "username": registered_user["username"],
         "password": "wrong_password",
     })
     assert resp.status_code == 400
-    assert "密码" in resp.json()["detail"]
+    assert resp.json()["detail"] == "账号或密码错误"
 
 
 def test_login_user_not_exist(client):
-    """用户不存在：返回 400。"""
+    """用户不存在：返回 400，且**不能**暴露"这个用户名不存在"。"""
     resp = client.post("/api/login", json={
         "username": "nobody",
         "password": "123456",
     })
     assert resp.status_code == 400
-    assert "不存在" in resp.json()["detail"]
+    assert resp.json()["detail"] == "账号或密码错误"
+    # 反向断言：只要文案里出现"不存在"，用户名枚举就又回来了
+    assert "不存在" not in resp.json()["detail"]
 
 
 def test_auth_required_for_protected_endpoint(client):

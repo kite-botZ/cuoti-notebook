@@ -23,6 +23,25 @@ class SaveProgressBody(BaseModel):
     current_index: int = 0
 
 
+def _ensure_bank_owned(bank_id: int, user_id: int, db: Session) -> None:
+    """校验题库属于当前用户。
+
+    三个端点（GET/PUT/DELETE）都要校验。原来只有 PUT 校验了：
+    GET/DELETE 直接按 `user_id` 过滤 `practice_sessions`，看起来"查不到别人的数据"，
+    但 `bank_id` 是攻击者可控的入参——他可以用别人的 `bank_id` 去问
+    "我有没有这个题库的进度"，返回值就能确认这个 id 是否存在，
+    也是一条不该存在的越权面。更重要的是三个端点的口径必须一致，
+    否则"PUT 说没有权限、GET 说没有记录"这种不一致会误导前端。
+    """
+    bank = (
+        db.query(QuestionBank)
+        .filter(QuestionBank.id == bank_id, QuestionBank.user_id == user_id)
+        .first()
+    )
+    if not bank:
+        raise HTTPException(status_code=404, detail="题库不存在")
+
+
 @router.get("/progress")
 def get_progress(
     bank_id: int,
@@ -31,6 +50,8 @@ def get_progress(
     db: Session = Depends(get_db),
 ):
     """读取上次练习进度。没有则返回 progress=None。"""
+    _ensure_bank_owned(bank_id, user_id, db)
+
     row = (
         db.query(PracticeSession)
         .filter(
@@ -59,14 +80,7 @@ def save_progress(
     db: Session = Depends(get_db),
 ):
     """保存练习进度。有则更新，无则创建。"""
-    # 校验题库归属，防止越权
-    bank = (
-        db.query(QuestionBank)
-        .filter(QuestionBank.id == body.bank_id, QuestionBank.user_id == user_id)
-        .first()
-    )
-    if not bank:
-        raise HTTPException(status_code=404, detail="题库不存在")
+    _ensure_bank_owned(body.bank_id, user_id, db)
 
     row = (
         db.query(PracticeSession)
@@ -105,6 +119,8 @@ def delete_progress(
     db: Session = Depends(get_db),
 ):
     """练习完成或用户选择"重新开始"时清除进度。"""
+    _ensure_bank_owned(bank_id, user_id, db)
+
     db.query(PracticeSession).filter(
         PracticeSession.user_id == user_id,
         PracticeSession.bank_id == bank_id,

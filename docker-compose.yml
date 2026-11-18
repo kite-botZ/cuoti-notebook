@@ -5,8 +5,11 @@ services:
     container_name: cuoti-db
     restart: unless-stopped
     environment:
-      MYSQL_ROOT_PASSWORD: ${DB_PASSWORD}
-      MYSQL_DATABASE: ${DB_NAME}
+      # `:?` 是 compose 的"必填"语法：变量没设就直接报错并打印这句话，
+      # 而不是像 `${DB_PASSWORD}` 那样悄悄替换成空字符串，
+      # 让 MySQL 容器以 "MYSQL_ROOT_PASSWORD 不能为空" 的方式失败（报错点离原因很远）。
+      MYSQL_ROOT_PASSWORD: ${DB_PASSWORD:?请先 cp .env.example .env 并设置 DB_PASSWORD}
+      MYSQL_DATABASE: ${DB_NAME:-cuoti_login}
       TZ: Asia/Shanghai
     command:
       - --character-set-server=utf8mb4
@@ -52,6 +55,11 @@ services:
   # ==================== 后端 ====================
   backend:
     build:
+      # 本仓库是 backend/ + frontend/ 两层，后端根在 backend/，
+      # 所以 context 必须是 ./backend（Dockerfile、requirements.txt、app/ 都在那一层）。
+      # 这里曾经被误改成 `.`：那是把 backend 的内容压平到仓库根之后产生的错觉，
+      # 真实的仓库根上并没有 app/ 和 requirements.txt，`context: .` 反而会
+      # `failed to read dockerfile: Dockerfile: no such file or directory`。
       context: ./backend
       dockerfile: Dockerfile
     container_name: cuoti-backend
@@ -68,14 +76,19 @@ services:
       - "host.docker.internal:host-gateway"
     environment:
       DB_USER: root
-      DB_PASSWORD: ${DB_PASSWORD}
+      DB_PASSWORD: ${DB_PASSWORD:?请先 cp .env.example .env 并设置 DB_PASSWORD}
       DB_HOST: db
       DB_PORT: 3306
-      DB_NAME: ${DB_NAME}
-      JWT_SECRET_KEY: ${JWT_SECRET_KEY}
+      DB_NAME: ${DB_NAME:-cuoti_login}
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:?请先 cp .env.example .env 并设置 JWT_SECRET_KEY}
       JWT_EXPIRE_SECONDS: 3600
       CODE_EXPIRE_SECONDS: 300
       APP_ENV: production
+      # 生产环境不回显验证码（`auth.echo_code_enabled()` 本来也会因为
+      # APP_ENV=production 而关掉，这里再显式写一遍，避免有人改了 APP_ENV 就意外打开）。
+      AUTH_ECHO_CODE: "0"
+      # 生产环境要求登录才能读 /uploads 图片（图片用 HttpOnly cookie 鉴权）。
+      UPLOAD_REQUIRE_AUTH: "1"
       # ---------- 模型服务：ollama 或 bailian ----------
       LLM_PROVIDER: ${LLM_PROVIDER:-ollama}
       AI_API_BASE: ${AI_API_BASE:-http://host.docker.internal:11434}
@@ -94,6 +107,25 @@ services:
     volumes:
       # 上传的图片挂载出来，容器重启不丢
       - uploads_data:/app/uploads
+    healthcheck:
+      # 不用 curl：python:3.12-slim 里没有 curl，健康检查会永远 unhealthy。
+      # 直接用解释器本身发一个请求，零额外依赖。
+      test:
+        - CMD
+        - python
+        - -c
+        - |
+          import sys, urllib.request
+          try:
+              code = urllib.request.urlopen("http://127.0.0.1:3000/", timeout=3).status
+          except Exception:
+              sys.exit(1)
+          sys.exit(0 if code == 200 else 1)
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      # 首次启动要建表（create_all），给足时间，别一上来就判死
+      start_period: 30s
 
   # ==================== 前端 ====================
   frontend:
@@ -103,7 +135,10 @@ services:
     container_name: cuoti-frontend
     restart: unless-stopped
     depends_on:
-      - backend
+      # 等后端真的能响应再起 nginx：否则首屏会拿到一堆 502，
+      # 用户以为部署失败（其实只是后端还在跑 create_all）。
+      backend:
+        condition: service_healthy
     ports:
       - "8080:80"
 

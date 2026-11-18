@@ -16,7 +16,7 @@ from sqlalchemy.orm import Session
 from app.cache import QLIST_TTL, cache
 from app.db import get_db
 from app.mastery import attach_kp_names, record_attempt
-from app.models import AnswerAttempt, Question, QuestionBank, QuestionUserState
+from app.models import AnswerAttempt, Question, QuestionBank, QuestionUserState, User
 from app.security import ALGORITHM, SECRET_KEY
 
 load_dotenv()
@@ -96,17 +96,47 @@ class BatchCutBody(BaseModel):
 security = HTTPBearer(auto_error=False)
 
 
+def decode_token(token: str, db: Session) -> int:
+    """校验 token 并返回 user_id。
+
+    除了签名和过期（PyJWT 负责），还要比对 `tv` 声明和库里的
+    `users.token_version`：改密码时该值 +1，于是**所有旧 token 立即失效**。
+    没有这一步，改密码只是换了库里的哈希，攻击者手上的旧 token 在
+    过期前（默认 1 小时）依然畅通无阻。
+
+    老版本签发的 token 没有 `tv`，会走 401 —— 这是一次性代价，
+    重新登录即可，比"永远无法吊销"好得多。
+    """
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+    except jwt.PyJWTError:
+        raise HTTPException(status_code=401, detail="登录已失效，请重新登录")
+
+    try:
+        user_id = int(payload["id"])
+        token_version = int(payload["tv"])
+    except (KeyError, TypeError, ValueError):
+        raise HTTPException(status_code=401, detail="登录已失效，请重新登录")
+
+    row = db.query(User.token_version).filter(User.id == user_id).first()
+    if row is None:
+        # 用户被删了，token 自然失效
+        raise HTTPException(status_code=401, detail="登录已失效，请重新登录")
+
+    current = row[0] if row[0] is not None else 1
+    if int(current) != token_version:
+        raise HTTPException(status_code=401, detail="登录已失效，请重新登录")
+
+    return user_id
+
+
 def current_user_id(
     credentials: HTTPAuthorizationCredentials | None = Depends(security),
+    db: Session = Depends(get_db),
 ) -> int:
     if not credentials:
         raise HTTPException(status_code=401, detail="请先登录")
-    token = credentials.credentials
-    try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        return int(payload["id"])
-    except (jwt.PyJWTError, KeyError, TypeError, ValueError):
-        raise HTTPException(status_code=401, detail="登录已失效，请重新登录")
+    return decode_token(credentials.credentials, db)
 
 
 # ============================================================
